@@ -2,7 +2,9 @@ import logging
 import os
 import re
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import signal
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -16,6 +18,23 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv"}
 
 DEFAULT_MIN_VIDEO_DURATION = 10.0
+
+STOP_EVENT = threading.Event()
+_SIGINT_COUNT = 0
+_SIGINT_LOCK = threading.Lock()
+
+
+def _handle_sigint(_signum, _frame):
+    global _SIGINT_COUNT
+    with _SIGINT_LOCK:
+        _SIGINT_COUNT += 1
+        count = _SIGINT_COUNT
+    STOP_EVENT.set()
+    if count == 1:
+        print("\nCtrl+C: cancelling... (press again to force quit)", file=sys.stderr, flush=True)
+    else:
+        print("\nForce quit.", file=sys.stderr, flush=True)
+        os._exit(130)
 
 # Regex to detect Windows-style absolute paths (e.g. C:\, D:\)
 _WIN_PATH_RE = re.compile(r"^[A-Za-z]:[\\\/]")
@@ -164,6 +183,13 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
         datefmt="%H:%M:%S",
     )
 
+    # Install Ctrl+C handler
+    STOP_EVENT.clear()
+    global _SIGINT_COUNT
+    with _SIGINT_LOCK:
+        _SIGINT_COUNT = 0
+    signal.signal(signal.SIGINT, _handle_sigint)
+
     input_path = Path(input_path).resolve()
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -231,7 +257,7 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
         pending_results[video_path] = scenes
         _flush_ready()
     else:
-        executor = ProcessPoolExecutor(max_workers=max_workers)
+        executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {
             executor.submit(_detect_scenes_for_video, v): v
             for v in videos
@@ -239,6 +265,8 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
         pbar = tqdm(total=len(futures), desc="Processing")
         try:
             for future in as_completed(futures):
+                if STOP_EVENT.is_set():
+                    break
                 pbar.update(1)
                 try:
                     video_path, scenes = future.result()
@@ -249,22 +277,14 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
                     click.echo(f"  ERROR {v.name}: {e}", err=True)
                     pending_results[v] = []
                     _flush_ready()
-        except KeyboardInterrupt:
-            cancelled = True
-            click.echo("\n\nCancelling... waiting for running workers to finish.", err=True)
-            # Cancel all pending futures
-            for f in futures:
-                f.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            # Flush whatever we have so far
-            _flush_ready()
         finally:
             pbar.close()
-            if not cancelled:
-                executor.shutdown(wait=True)
-
-        # Flush any remaining
-        if not cancelled:
+            cancelled = STOP_EVENT.is_set()
+            if cancelled:
+                for f in futures:
+                    f.cancel()
+            executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
+            # Flush whatever is ready
             _flush_ready()
 
     if cancelled:
