@@ -89,10 +89,10 @@ class TestIntraScenePairs:
         count = extract_intra_scene_pairs(video, scenes, output)
 
         assert count == 2
-        assert (output / "0001_A.jpg").exists()
-        assert (output / "0001_B.jpg").exists()
-        assert (output / "0002_A.jpg").exists()
-        assert (output / "0002_B.jpg").exists()
+        assert (output / "000001_A.jpg").exists()
+        assert (output / "000001_B.jpg").exists()
+        assert (output / "000002_A.jpg").exists()
+        assert (output / "000002_B.jpg").exists()
 
     def test_skips_scenes_too_short_for_offset(self, tmp_path):
         video = tmp_path / "test.mp4"
@@ -132,10 +132,10 @@ class TestInterScenePairsSequential:
         count = extract_inter_scene_pairs_sequential(video, scenes, output)
 
         assert count == 2
-        assert (output / "0001_A.jpg").exists()
-        assert (output / "0001_B.jpg").exists()
-        assert (output / "0002_A.jpg").exists()
-        assert (output / "0002_B.jpg").exists()
+        assert (output / "000001_A.jpg").exists()
+        assert (output / "000001_B.jpg").exists()
+        assert (output / "000002_A.jpg").exists()
+        assert (output / "000002_B.jpg").exists()
 
     def test_discards_odd_scene(self, tmp_path):
         video = tmp_path / "test.mp4"
@@ -202,10 +202,10 @@ class TestInterScenePairsSliding:
         count = extract_inter_scene_pairs_sliding(video, scenes, output)
 
         assert count == 2
-        assert (output / "0001_A.jpg").exists()
-        assert (output / "0001_B.jpg").exists()
-        assert (output / "0002_A.jpg").exists()
-        assert (output / "0002_B.jpg").exists()
+        assert (output / "000001_A.jpg").exists()
+        assert (output / "000001_B.jpg").exists()
+        assert (output / "000002_A.jpg").exists()
+        assert (output / "000002_B.jpg").exists()
 
     def test_single_scene_returns_zero(self, tmp_path):
         video = tmp_path / "test.mp4"

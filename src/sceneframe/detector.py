@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,15 +77,18 @@ def re_detect_long_scenes(
             from scenedetect import SceneManager, open_video, AdaptiveDetector
 
             video = open_video(str(video_path))
-            video.seek(scene.start_frame)
+            try:
+                video.seek(scene.start_frame)
 
-            scene_manager = SceneManager()
-            scene_manager.add_detector(
-                AdaptiveDetector(adaptive_threshold=1.5)
-            )
+                scene_manager = SceneManager()
+                scene_manager.add_detector(
+                    AdaptiveDetector(adaptive_threshold=1.5)
+                )
 
-            scene_manager.detect_scenes(video, end_frame=scene.end_frame)
-            sub_scenes = scene_manager.get_scene_list()
+                scene_manager.detect_scenes(video, end_time=scene.end_frame)
+                sub_scenes = scene_manager.get_scene_list()
+            finally:
+                del video
 
             if len(sub_scenes) <= 1:
                 result.append(scene)

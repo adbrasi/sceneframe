@@ -90,7 +90,7 @@ def extract_intra_scene_pairs(
                 continue
 
             pair_count += 1
-            label = f"{start_index + pair_count:04d}"
+            label = f"{start_index + pair_count:06d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
     finally:
@@ -130,7 +130,8 @@ def extract_inter_scene_pairs_sequential(
             idx_b = scene_b.start_frame + FRAME_OFFSET
 
             # Guard against scenes too short for the offset
-            if idx_a >= scene_a.end_frame or idx_b >= scene_b.end_frame:
+            # end_frame is exclusive, so last valid frame is end_frame - 1
+            if idx_a >= scene_a.end_frame - 1 or idx_b >= scene_b.end_frame - 1:
                 continue
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx_a)
@@ -144,7 +145,7 @@ def extract_inter_scene_pairs_sequential(
                 continue
 
             pair_count += 1
-            label = f"{start_index + pair_count:04d}"
+            label = f"{start_index + pair_count:06d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
     finally:
@@ -186,7 +187,8 @@ def extract_inter_scene_pairs_sliding(
             idx_b = scene_b.start_frame + FRAME_OFFSET
 
             # Guard against scenes too short for the offset
-            if idx_a >= scene_a.end_frame or idx_b >= scene_b.end_frame:
+            # end_frame is exclusive, so last valid frame is end_frame - 1
+            if idx_a >= scene_a.end_frame - 1 or idx_b >= scene_b.end_frame - 1:
                 continue
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx_a)
@@ -200,7 +202,7 @@ def extract_inter_scene_pairs_sliding(
                 continue
 
             pair_count += 1
-            label = f"{start_index + pair_count:04d}"
+            label = f"{start_index + pair_count:06d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
     finally:

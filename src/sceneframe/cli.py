@@ -1,7 +1,9 @@
 import logging
 import os
+import re
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import click
 import cv2
@@ -14,6 +16,24 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv"}
 
 DEFAULT_MIN_VIDEO_DURATION = 10.0
+
+# Regex to detect Windows-style absolute paths (e.g. C:\, D:\)
+_WIN_PATH_RE = re.compile(r"^[A-Za-z]:[\\\/]")
+
+
+def _resolve_path_from_txt(line: str, txt_parent: Path) -> Path:
+    """Resolve a path from a .txt file, handling Windows paths on WSL."""
+    # Detect Windows-style path and convert to WSL mount if running on Linux
+    if _WIN_PATH_RE.match(line) and sys.platform != "win32":
+        drive = line[0].lower()
+        rest = line[2:].replace("\\", "/").lstrip("/")
+        return Path(f"/mnt/{drive}/{rest}")
+
+    folder = Path(line)
+    # Resolve relative paths against the .txt file's parent directory
+    if not folder.is_absolute():
+        folder = txt_parent / folder
+    return folder.resolve()
 
 
 def _get_video_duration(video_path: Path) -> float:
@@ -67,7 +87,7 @@ def _extract_pairs(
 ) -> int:
     """Extract frame pairs from all videos sequentially with global numbering.
 
-    Output is flat: output_dir/0001_A.jpg, 0001_B.jpg, 0002_A.jpg, ...
+    Output is flat: output_dir/000001_A.jpg, 000001_B.jpg, ...
     For mode "all", creates subdirs: output_dir/intra/, output_dir/inter-seq/, output_dir/inter-slide/
     """
     from .extractor import (
@@ -144,7 +164,8 @@ def _extract_pairs(
 def main(input_path: Path, output: Path, mode: str, min_duration: float):
     """Extract frame pairs from video scenes for model training.
 
-    INPUT_PATH can be a directory of videos or a single video file.
+    INPUT_PATH can be a directory of videos, a single video file, or a .txt
+    file with one directory path per line (lines starting with # are ignored).
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -164,9 +185,9 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            folder = Path(line)
+            folder = _resolve_path_from_txt(line, input_path.parent)
             if not folder.is_dir():
-                click.echo(f"Skipping (not a directory): {line}", err=True)
+                click.echo(f"Skipping (not a directory): {line} -> {folder}", err=True)
                 continue
             videos.extend(_find_videos(folder, min_duration=min_duration))
     elif input_path.is_file():
@@ -208,6 +229,10 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float):
                 except Exception as e:
                     v = futures[future]
                     click.echo(f"  ERROR {v.name}: {e}", err=True)
+
+        # Sort by original video order for deterministic global numbering
+        video_order = {v: i for i, v in enumerate(videos)}
+        video_scenes.sort(key=lambda x: video_order.get(x[0], 0))
 
     total_scenes = sum(len(s) for _, s in video_scenes)
     if total_scenes == 0:
