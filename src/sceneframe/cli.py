@@ -4,19 +4,48 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import click
+import cv2
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv"}
 
+DEFAULT_MIN_VIDEO_DURATION = 10.0
 
-def _find_videos(input_dir: Path) -> list[Path]:
-    """Find all video files in a directory."""
-    return sorted(
+
+def _get_video_duration(video_path: Path) -> float:
+    """Get video duration in seconds using OpenCV. Returns 0.0 on failure."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return 0.0
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if fps > 0 and frame_count > 0:
+            return frame_count / fps
+        return 0.0
+    finally:
+        cap.release()
+
+
+def _find_videos(input_dir: Path, min_duration: float = 0.0) -> list[Path]:
+    """Find all video files in a directory, optionally filtering by minimum duration."""
+    candidates = sorted(
         f for f in input_dir.iterdir()
         if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
     )
+    if min_duration <= 0:
+        return candidates
+
+    result = []
+    for v in candidates:
+        dur = _get_video_duration(v)
+        if dur >= min_duration:
+            result.append(v)
+        else:
+            logger.info("Skipping %s (%.1fs < %.1fs min)", v.name, dur, min_duration)
+    return result
 
 
 def _process_single_video(
@@ -100,7 +129,14 @@ def _print_result(result: dict):
         "all = run all three modes"
     ),
 )
-def main(input_path: Path, output: Path, mode: str):
+@click.option(
+    "--min-duration",
+    type=float,
+    default=DEFAULT_MIN_VIDEO_DURATION,
+    show_default=True,
+    help="Minimum video duration in seconds. Videos shorter than this are skipped.",
+)
+def main(input_path: Path, output: Path, mode: str, min_duration: float):
     """Extract frame pairs from video scenes for model training.
 
     INPUT_PATH can be a directory of videos or a single video file.
@@ -116,9 +152,13 @@ def main(input_path: Path, output: Path, mode: str):
     output.mkdir(parents=True, exist_ok=True)
 
     if input_path.is_file():
+        dur = _get_video_duration(input_path)
+        if dur < min_duration:
+            click.echo(f"Video too short ({dur:.1f}s < {min_duration:.1f}s min).", err=True)
+            raise SystemExit(1)
         videos = [input_path]
     else:
-        videos = _find_videos(input_path)
+        videos = _find_videos(input_path, min_duration=min_duration)
 
     if not videos:
         click.echo("No video files found.", err=True)
