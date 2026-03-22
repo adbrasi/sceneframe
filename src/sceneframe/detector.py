@@ -30,12 +30,22 @@ def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBou
     try:
         from scenedetect import detect, ContentDetector
 
+        from scenedetect import open_video as sv_open_video
+
         scene_list = detect(str(video_path), ContentDetector(), show_progress=show_progress)
 
+        # Get video info for fallback
+        video = sv_open_video(str(video_path))
+        fps = video.frame_rate
+        total_frames = video.duration.frame_num
+        del video
+
         if not scene_list:
+            # No cuts detected — treat entire video as one scene
+            if total_frames > 0:
+                return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
             return []
 
-        fps = scene_list[0][0].framerate
         boundaries = []
         for start_tc, end_tc in scene_list:
             boundaries.append(

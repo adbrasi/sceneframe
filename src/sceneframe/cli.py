@@ -224,36 +224,53 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
             else:
                 click.echo(f"  [{processed}/{len(videos)}] {video_path.name}: no scenes")
 
+    cancelled = False
+
     if len(videos) == 1:
         video_path, scenes = _detect_scenes_for_video(videos[0])
         pending_results[video_path] = scenes
         _flush_ready()
     else:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_detect_scenes_for_video, v): v
-                for v in videos
-            }
-            pbar = tqdm(total=len(futures), desc="Processing")
+        executor = ProcessPoolExecutor(max_workers=max_workers)
+        futures = {
+            executor.submit(_detect_scenes_for_video, v): v
+            for v in videos
+        }
+        pbar = tqdm(total=len(futures), desc="Processing")
+        try:
             for future in as_completed(futures):
                 pbar.update(1)
                 try:
                     video_path, scenes = future.result()
                     pending_results[video_path] = scenes
-                    # Extract all videos that are ready in order
                     _flush_ready()
                 except Exception as e:
                     v = futures[future]
                     click.echo(f"  ERROR {v.name}: {e}", err=True)
-                    # Mark as empty so ordering continues
                     pending_results[v] = []
                     _flush_ready()
+        except KeyboardInterrupt:
+            cancelled = True
+            click.echo("\n\nCancelling... waiting for running workers to finish.", err=True)
+            # Cancel all pending futures
+            for f in futures:
+                f.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            # Flush whatever we have so far
+            _flush_ready()
+        finally:
             pbar.close()
+            if not cancelled:
+                executor.shutdown(wait=True)
 
         # Flush any remaining
-        _flush_ready()
+        if not cancelled:
+            _flush_ready()
 
-    click.echo(f"\nDone! {total_pairs} pairs from {len(videos)} videos -> {output}")
+    if cancelled:
+        click.echo(f"\nCancelled. Saved {total_pairs} pairs from {processed} videos so far -> {output}")
+    else:
+        click.echo(f"\nDone! {total_pairs} pairs from {len(videos)} videos -> {output}")
 
 
 if __name__ == "__main__":
