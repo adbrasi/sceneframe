@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dataset-maker"
+version = "0.2.0"
+description = "CLI to create labeled video datasets from anime/series episodes"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "aiohttp>=3.9",
+    "tqdm>=4.66",
+    "scenedetect[opencv]>=0.6",
+    "numpy>=1.24",
+    "tensorflow>=2.15",
+    "transnetv2 @ git+https://github.com/soCzech/TransNetV2.git",
+    "ffmpeg-python>=0.2",
+]
+
+[project.scripts]
+dataset-maker = "dataset_maker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dataset_maker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+node_modules/
+dist/
+build/
+.vscode/
+test_output/
+test_video/
+*.mp4
+*.deb
