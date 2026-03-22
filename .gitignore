@@ -11,3 +11,5 @@ test_output/
 test_video/
 *.mp4
 *.deb
+*.egg-info/
+.pytest_cache/
