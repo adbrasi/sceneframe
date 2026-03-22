@@ -7,6 +7,8 @@ import click
 import cv2
 from tqdm import tqdm
 
+from .detector import SceneBoundary
+
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv"}
@@ -48,64 +50,67 @@ def _find_videos(input_dir: Path, min_duration: float = 0.0) -> list[Path]:
     return result
 
 
-def _process_single_video(
-    video_path: Path,
+def _detect_scenes_for_video(video_path: Path) -> tuple[Path, list[SceneBoundary]]:
+    """Detect and re-segment scenes for a single video. Runs in worker process."""
+    from .detector import detect_scenes, re_detect_long_scenes
+
+    scenes = detect_scenes(video_path, show_progress=False)
+    if scenes:
+        scenes = re_detect_long_scenes(video_path, scenes, max_seconds=20.0)
+    return video_path, scenes
+
+
+def _extract_pairs(
+    video_scenes: list[tuple[Path, list[SceneBoundary]]],
     output_dir: Path,
     mode: str,
-) -> dict:
-    """Process a single video: detect scenes, re-segment, extract pairs.
+) -> int:
+    """Extract frame pairs from all videos sequentially with global numbering.
 
-    Runs in a worker process.
+    Output is flat: output_dir/0001_A.jpg, 0001_B.jpg, 0002_A.jpg, ...
+    For mode "all", creates subdirs: output_dir/intra/, output_dir/inter-seq/, output_dir/inter-slide/
     """
-    from .detector import detect_scenes, re_detect_long_scenes
     from .extractor import (
         extract_intra_scene_pairs,
         extract_inter_scene_pairs_sequential,
         extract_inter_scene_pairs_sliding,
     )
 
-    video_name = video_path.stem
-    result = {"video": video_path.name, "pairs": 0, "scenes": 0, "error": None}
+    if mode == "all":
+        intra_dir = output_dir / "intra"
+        inter_seq_dir = output_dir / "inter-seq"
+        inter_slide_dir = output_dir / "inter-slide"
 
-    try:
-        scenes = detect_scenes(video_path, show_progress=False)
+        intra_count = 0
+        seq_count = 0
+        slide_count = 0
+
+        for video_path, scenes in video_scenes:
+            if not scenes:
+                continue
+            p1 = extract_intra_scene_pairs(video_path, scenes, intra_dir, start_index=intra_count)
+            intra_count += p1
+            p2 = extract_inter_scene_pairs_sequential(video_path, scenes, inter_seq_dir, start_index=seq_count)
+            seq_count += p2
+            p3 = extract_inter_scene_pairs_sliding(video_path, scenes, inter_slide_dir, start_index=slide_count)
+            slide_count += p3
+
+        return intra_count + seq_count + slide_count
+
+    extract_fn = {
+        "intra": extract_intra_scene_pairs,
+        "inter-seq": extract_inter_scene_pairs_sequential,
+        "inter-slide": extract_inter_scene_pairs_sliding,
+    }[mode]
+
+    global_count = 0
+    for video_path, scenes in video_scenes:
         if not scenes:
-            return result
+            continue
+        pairs = extract_fn(video_path, scenes, output_dir, start_index=global_count)
+        global_count += pairs
 
-        scenes = re_detect_long_scenes(video_path, scenes, max_seconds=20.0)
-        result["scenes"] = len(scenes)
-
-        video_output = output_dir / video_name
-
-        if mode == "intra":
-            pairs = extract_intra_scene_pairs(video_path, scenes, video_output)
-        elif mode == "inter-seq":
-            pairs = extract_inter_scene_pairs_sequential(video_path, scenes, video_output)
-        elif mode == "inter-slide":
-            pairs = extract_inter_scene_pairs_sliding(video_path, scenes, video_output)
-        else:
-            p1 = extract_intra_scene_pairs(video_path, scenes, video_output / "intra")
-            p2 = extract_inter_scene_pairs_sequential(video_path, scenes, video_output / "inter-seq")
-            p3 = extract_inter_scene_pairs_sliding(video_path, scenes, video_output / "inter-slide")
-            pairs = p1 + p2 + p3
-
-        result["pairs"] = pairs
-
-    except Exception as e:
-        result["error"] = str(e)
-        logger.error("Failed to process %s: %s", video_path.name, e)
-
-    return result
-
-
-def _print_result(result: dict):
-    """Print processing result for a single video."""
-    if result["error"]:
-        click.echo(f"  ERROR {result['video']}: {result['error']}", err=True)
-    elif result["pairs"] == 0:
-        click.echo(f"  {result['video']}: no scenes detected")
-    else:
-        click.echo(f"  {result['video']}: {result['scenes']} scenes -> {result['pairs']} pairs")
+    return global_count
 
 
 @click.command()
@@ -151,7 +156,20 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
 
-    if input_path.is_file():
+    if input_path.is_file() and input_path.suffix.lower() == ".txt":
+        # Read list of directories from text file (one path per line)
+        lines = input_path.read_text(encoding="utf-8").splitlines()
+        videos = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            folder = Path(line)
+            if not folder.is_dir():
+                click.echo(f"Skipping (not a directory): {line}", err=True)
+                continue
+            videos.extend(_find_videos(folder, min_duration=min_duration))
+    elif input_path.is_file():
         dur = _get_video_duration(input_path)
         if dur < min_duration:
             click.echo(f"Video too short ({dur:.1f}s < {min_duration:.1f}s min).", err=True)
@@ -166,26 +184,41 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float):
 
     click.echo(f"Found {len(videos)} video(s). Mode: {mode}")
 
+    # Phase 1: Detect scenes in parallel
+    click.echo("Detecting scenes...")
+    video_scenes: list[tuple[Path, list[SceneBoundary]]] = []
     workers = min(os.cpu_count() or 1, len(videos))
 
     if len(videos) == 1:
-        result = _process_single_video(videos[0], output, mode)
-        _print_result(result)
-        return
+        result = _detect_scenes_for_video(videos[0])
+        video_scenes.append(result)
+        scenes_count = len(result[1])
+        click.echo(f"  {result[0].name}: {scenes_count} scenes")
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_detect_scenes_for_video, v): v
+                for v in videos
+            }
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Detecting"):
+                try:
+                    video_path, scenes = future.result()
+                    video_scenes.append((video_path, scenes))
+                    click.echo(f"  {video_path.name}: {len(scenes)} scenes")
+                except Exception as e:
+                    v = futures[future]
+                    click.echo(f"  ERROR {v.name}: {e}", err=True)
 
-    total_pairs = 0
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_process_single_video, v, output, mode): v
-            for v in videos
-        }
+    total_scenes = sum(len(s) for _, s in video_scenes)
+    if total_scenes == 0:
+        click.echo("No scenes detected in any video.", err=True)
+        raise SystemExit(1)
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
-            result = future.result()
-            _print_result(result)
-            total_pairs += result["pairs"]
+    # Phase 2: Extract pairs sequentially (global numbering)
+    click.echo(f"\nExtracting pairs from {total_scenes} scenes...")
+    total_pairs = _extract_pairs(video_scenes, output, mode)
 
-    click.echo(f"\nDone! {total_pairs} total pairs from {len(videos)} videos.")
+    click.echo(f"\nDone! {total_pairs} pairs from {len(videos)} videos -> {output}")
 
 
 if __name__ == "__main__":

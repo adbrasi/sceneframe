@@ -54,10 +54,11 @@ def extract_intra_scene_pairs(
     video_path: Path,
     scenes: list[SceneBoundary],
     output_dir: Path,
+    start_index: int = 0,
 ) -> int:
     """Mode 1: Extract first and last frame of each scene as pairs.
 
-    Saves as 0001_A.jpg / 0001_B.jpg, etc.
+    Saves as NNNN_A.jpg / NNNN_B.jpg with numbering starting at start_index + 1.
     Returns the number of pairs saved.
     """
     output_dir = Path(output_dir)
@@ -89,7 +90,7 @@ def extract_intra_scene_pairs(
                 continue
 
             pair_count += 1
-            label = f"{pair_count:04d}"
+            label = f"{start_index + pair_count:04d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
     finally:
@@ -102,6 +103,7 @@ def extract_inter_scene_pairs_sequential(
     video_path: Path,
     scenes: list[SceneBoundary],
     output_dir: Path,
+    start_index: int = 0,
 ) -> int:
     """Mode 2a: Pair first frames of consecutive scenes (no overlap).
 
@@ -142,7 +144,7 @@ def extract_inter_scene_pairs_sequential(
                 continue
 
             pair_count += 1
-            label = f"{pair_count:04d}"
+            label = f"{start_index + pair_count:04d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
     finally:
@@ -155,6 +157,7 @@ def extract_inter_scene_pairs_sliding(
     video_path: Path,
     scenes: list[SceneBoundary],
     output_dir: Path,
+    start_index: int = 0,
 ) -> int:
     """Mode 2b: Pair first frames of consecutive scenes (sliding window).
 
@@ -197,7 +200,7 @@ def extract_inter_scene_pairs_sliding(
                 continue
 
             pair_count += 1
-            label = f"{pair_count:04d}"
+            label = f"{start_index + pair_count:04d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
     finally:
