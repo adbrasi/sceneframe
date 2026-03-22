@@ -43,9 +43,11 @@ def _safe_frame_indices(
     Returns None if the scene is too short for the offset.
     """
     total_frames = scene.end_frame - scene.start_frame
-    if total_frames <= offset * 2:
+    # Need at least offset*2 + 1 frames so start and end don't overlap
+    if total_frames <= offset * 2 + 1:
         return None
-    return scene.start_frame + offset, scene.end_frame - offset
+    # end_frame is exclusive (first frame of next scene), so last frame is end_frame - 1
+    return scene.start_frame + offset, scene.end_frame - 1 - offset
 
 
 def extract_intra_scene_pairs(
@@ -125,6 +127,10 @@ def extract_inter_scene_pairs_sequential(
             idx_a = scene_a.start_frame + FRAME_OFFSET
             idx_b = scene_b.start_frame + FRAME_OFFSET
 
+            # Guard against scenes too short for the offset
+            if idx_a >= scene_a.end_frame or idx_b >= scene_b.end_frame:
+                continue
+
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx_a)
             ret_a, frame_a = cap.read()
             if not ret_a:
@@ -175,6 +181,10 @@ def extract_inter_scene_pairs_sliding(
 
             idx_a = scene_a.start_frame + FRAME_OFFSET
             idx_b = scene_b.start_frame + FRAME_OFFSET
+
+            # Guard against scenes too short for the offset
+            if idx_a >= scene_a.end_frame or idx_b >= scene_b.end_frame:
+                continue
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx_a)
             ret_a, frame_a = cap.read()

@@ -6,11 +6,6 @@ from pathlib import Path
 import click
 from tqdm import tqdm
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv"}
@@ -44,7 +39,7 @@ def _process_single_video(
     result = {"video": video_path.name, "pairs": 0, "scenes": 0, "error": None}
 
     try:
-        scenes = detect_scenes(video_path)
+        scenes = detect_scenes(video_path, show_progress=False)
         if not scenes:
             return result
 
@@ -110,6 +105,12 @@ def main(input_path: Path, output: Path, mode: str):
 
     INPUT_PATH can be a directory of videos or a single video file.
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     input_path = Path(input_path).resolve()
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)

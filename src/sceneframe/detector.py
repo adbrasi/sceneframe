@@ -16,7 +16,7 @@ class SceneBoundary:
         return (self.end_frame - self.start_frame) / self.fps
 
 
-def detect_scenes(video_path: Path) -> list[SceneBoundary]:
+def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBoundary]:
     """Detect scene boundaries in a video using PySceneDetect ContentDetector.
 
     Returns a list of SceneBoundary. Returns empty list on failure.
@@ -29,7 +29,7 @@ def detect_scenes(video_path: Path) -> list[SceneBoundary]:
     try:
         from scenedetect import detect, ContentDetector
 
-        scene_list = detect(str(video_path), ContentDetector(), show_progress=True)
+        scene_list = detect(str(video_path), ContentDetector(), show_progress=show_progress)
 
         if not scene_list:
             return []
