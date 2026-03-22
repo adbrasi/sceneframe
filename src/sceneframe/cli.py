@@ -161,7 +161,13 @@ def _extract_pairs(
     show_default=True,
     help="Minimum video duration in seconds. Videos shorter than this are skipped.",
 )
-def main(input_path: Path, output: Path, mode: str, min_duration: float):
+@click.option(
+    "--workers", "-w",
+    type=int,
+    default=None,
+    help="Number of parallel workers for scene detection. Defaults to CPU count - 2.",
+)
+def main(input_path: Path, output: Path, mode: str, min_duration: float, workers: int | None):
     """Extract frame pairs from video scenes for model training.
 
     INPUT_PATH can be a directory of videos, a single video file, or a .txt
@@ -208,7 +214,9 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float):
     # Phase 1: Detect scenes in parallel
     click.echo("Detecting scenes...")
     video_scenes: list[tuple[Path, list[SceneBoundary]]] = []
-    workers = min(os.cpu_count() or 1, len(videos))
+    cpu_count = os.cpu_count() or 4
+    max_workers = workers if workers else max(1, cpu_count - 2)
+    max_workers = min(max_workers, len(videos))
 
     if len(videos) == 1:
         result = _detect_scenes_for_video(videos[0])
@@ -216,7 +224,8 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float):
         scenes_count = len(result[1])
         click.echo(f"  {result[0].name}: {scenes_count} scenes")
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        click.echo(f"Using {max_workers} workers (of {cpu_count} CPUs)")
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(_detect_scenes_for_video, v): v
                 for v in videos
