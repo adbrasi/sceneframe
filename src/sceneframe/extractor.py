@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 FRAME_OFFSET = 3
 JPEG_QUALITY = 95
-SOLID_THRESHOLD = 12.0
+SOLID_THRESHOLD = 20.0
 
 
 def extract_frame(video_path: Path, frame_index: int) -> np.ndarray | None:
