@@ -14,12 +14,13 @@ from sceneframe.extractor import (
 
 
 def _make_test_video(path: Path, num_frames: int = 100, fps: float = 24.0):
-    """Create a minimal test video with colored frames."""
+    """Create a minimal test video with noisy frames (not solid color)."""
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(path), fourcc, fps, (64, 64))
+    rng = np.random.RandomState(42)
     for i in range(num_frames):
-        frame = np.full((64, 64, 3), fill_value=i % 256, dtype=np.uint8)
-        writer.write(frame)
+        base = rng.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        writer.write(base)
     writer.release()
 
 

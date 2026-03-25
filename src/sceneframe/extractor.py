@@ -4,12 +4,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .cleaner import is_solid_color
 from .detector import SceneBoundary
 
 logger = logging.getLogger(__name__)
 
 FRAME_OFFSET = 3
 JPEG_QUALITY = 95
+SOLID_THRESHOLD = 12.0
 
 
 def extract_frame(video_path: Path, frame_index: int) -> np.ndarray | None:
@@ -48,6 +50,37 @@ def _safe_frame_indices(
         return None
     # end_frame is exclusive (first frame of next scene), so last frame is end_frame - 1
     return scene.start_frame + offset, scene.end_frame - 1 - offset
+
+
+def _fix_solid_frame(
+    cap: cv2.VideoCapture,
+    frame: np.ndarray,
+    frame_idx: int,
+    scene: SceneBoundary,
+) -> np.ndarray | None:
+    """If frame is solid color, try to replace it with a frame ~1s away within the scene.
+
+    Tries forward first (+fps), then backward (-fps). Returns None if
+    no valid replacement is found (out of scene bounds or also solid).
+    """
+    if not is_solid_color(frame, SOLID_THRESHOLD):
+        return frame
+
+    offset = max(1, round(scene.fps))
+    # Try forward, then backward
+    for direction in (offset, -offset):
+        alt_idx = frame_idx + direction
+        if alt_idx < scene.start_frame or alt_idx >= scene.end_frame:
+            continue
+        cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
+        ret, alt_frame = cap.read()
+        if ret and not is_solid_color(alt_frame, SOLID_THRESHOLD):
+            logger.debug("Replaced solid frame %d with %d", frame_idx, alt_idx)
+            return alt_frame
+
+    logger.debug("Could not replace solid frame %d in scene [%d, %d)",
+                 frame_idx, scene.start_frame, scene.end_frame)
+    return None
 
 
 def extract_intra_scene_pairs(
@@ -91,6 +124,14 @@ def extract_intra_scene_pairs(
             cap.set(cv2.CAP_PROP_POS_FRAMES, end_idx)
             ret_b, frame_b = cap.read()
             if not ret_b:
+                continue
+
+            frame_a = _fix_solid_frame(cap, frame_a, start_idx, scene)
+            if frame_a is None:
+                continue
+
+            frame_b = _fix_solid_frame(cap, frame_b, end_idx, scene)
+            if frame_b is None:
                 continue
 
             pair_count += 1
@@ -152,6 +193,14 @@ def extract_inter_scene_pairs_sequential(
             if not ret_b:
                 continue
 
+            frame_a = _fix_solid_frame(cap, frame_a, idx_a, scene_a)
+            if frame_a is None:
+                continue
+
+            frame_b = _fix_solid_frame(cap, frame_b, idx_b, scene_b)
+            if frame_b is None:
+                continue
+
             pair_count += 1
             label = f"{start_index + pair_count:06d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
@@ -211,6 +260,14 @@ def extract_inter_scene_pairs_sliding(
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx_b)
             ret_b, frame_b = cap.read()
             if not ret_b:
+                continue
+
+            frame_a = _fix_solid_frame(cap, frame_a, idx_a, scene_a)
+            if frame_a is None:
+                continue
+
+            frame_b = _fix_solid_frame(cap, frame_b, idx_b, scene_b)
+            if frame_b is None:
                 continue
 
             pair_count += 1
