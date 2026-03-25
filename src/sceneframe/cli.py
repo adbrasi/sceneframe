@@ -1,8 +1,10 @@
+"""CLI entry point for SceneFrame."""
+
 import logging
 import os
 import re
-import sys
 import signal
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -35,6 +37,16 @@ def _handle_sigint(_signum, _frame):
     else:
         print("\nForce quit.", file=sys.stderr, flush=True)
         os._exit(130)
+
+
+def _init_signal_handler():
+    """Install the Ctrl+C handler and reset state."""
+    STOP_EVENT.clear()
+    global _SIGINT_COUNT
+    with _SIGINT_LOCK:
+        _SIGINT_COUNT = 0
+    signal.signal(signal.SIGINT, _handle_sigint)
+
 
 # Regex to detect Windows-style absolute paths (e.g. C:\, D:\)
 _WIN_PATH_RE = re.compile(r"^[A-Za-z]:[\\\/]")
@@ -87,8 +99,33 @@ def _find_videos(input_dir: Path, min_duration: float = 0.0) -> list[Path]:
     return result
 
 
+def _resolve_videos(input_path: Path, min_duration: float) -> list[Path]:
+    """Resolve input path to a list of video files."""
+    if input_path.is_file() and input_path.suffix.lower() == ".txt":
+        lines = input_path.read_text(encoding="utf-8").splitlines()
+        videos = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            folder = _resolve_path_from_txt(line, input_path.parent)
+            if not folder.is_dir():
+                click.echo(f"Skipping (not a directory): {line} -> {folder}", err=True)
+                continue
+            videos.extend(_find_videos(folder, min_duration=min_duration))
+        return videos
+    elif input_path.is_file():
+        dur = _get_video_duration(input_path)
+        if dur < min_duration:
+            click.echo(f"Video too short ({dur:.1f}s < {min_duration:.1f}s min).", err=True)
+            raise SystemExit(1)
+        return [input_path]
+    else:
+        return _find_videos(input_path, min_duration=min_duration)
+
+
 def _detect_scenes_for_video(video_path: Path) -> tuple[Path, list[SceneBoundary]]:
-    """Detect and re-segment scenes for a single video. Runs in worker process."""
+    """Detect and re-segment scenes for a single video. Runs in worker thread."""
     from .detector import detect_scenes, re_detect_long_scenes
 
     scenes = detect_scenes(video_path, show_progress=False)
@@ -103,6 +140,7 @@ def _extract_for_video(
     output_dir: Path,
     mode: str,
     counters: dict[str, int],
+    max_pairs: int | None = None,
 ) -> int:
     """Extract frame pairs for a single video, updating global counters in-place."""
     from .extractor import (
@@ -117,11 +155,20 @@ def _extract_for_video(
     total = 0
 
     if mode == "all":
-        p1 = extract_intra_scene_pairs(video_path, scenes, output_dir / "intra", start_index=counters["intra"])
+        p1 = extract_intra_scene_pairs(
+            video_path, scenes, output_dir / "intra",
+            start_index=counters["intra"], max_pairs=max_pairs,
+        )
         counters["intra"] += p1
-        p2 = extract_inter_scene_pairs_sequential(video_path, scenes, output_dir / "inter-seq", start_index=counters["inter-seq"])
+        p2 = extract_inter_scene_pairs_sequential(
+            video_path, scenes, output_dir / "inter-seq",
+            start_index=counters["inter-seq"], max_pairs=max_pairs,
+        )
         counters["inter-seq"] += p2
-        p3 = extract_inter_scene_pairs_sliding(video_path, scenes, output_dir / "inter-slide", start_index=counters["inter-slide"])
+        p3 = extract_inter_scene_pairs_sliding(
+            video_path, scenes, output_dir / "inter-slide",
+            start_index=counters["inter-slide"], max_pairs=max_pairs,
+        )
         counters["inter-slide"] += p3
         total = p1 + p2 + p3
     else:
@@ -130,20 +177,36 @@ def _extract_for_video(
             "inter-seq": extract_inter_scene_pairs_sequential,
             "inter-slide": extract_inter_scene_pairs_sliding,
         }[mode]
-        pairs = extract_fn(video_path, scenes, output_dir, start_index=counters["main"])
+        pairs = extract_fn(
+            video_path, scenes, output_dir,
+            start_index=counters["main"], max_pairs=max_pairs,
+        )
         counters["main"] += pairs
         total = pairs
 
     return total
 
 
-@click.command()
+# ---------------------------------------------------------------------------
+# CLI group
+# ---------------------------------------------------------------------------
+
+@click.group()
+def cli():
+    """SceneFrame: Extract frame pairs from video scenes for model training."""
+
+
+# ---------------------------------------------------------------------------
+# extract command
+# ---------------------------------------------------------------------------
+
+@cli.command()
 @click.argument("input_path", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--output", "-o",
     type=click.Path(path_type=Path),
     required=True,
-    help="Output directory for frame pairs",
+    help="Output directory for frame pairs.",
 )
 @click.option(
     "--mode", "-m",
@@ -153,9 +216,9 @@ def _extract_for_video(
     help=(
         "Extraction mode: "
         "intra = first+last frame per scene, "
-        "inter-seq = first frames of consecutive scene pairs (no overlap), "
-        "inter-slide = first frames of consecutive scenes (sliding window), "
-        "all = run all three modes"
+        "inter-seq = consecutive scene pairs (no overlap), "
+        "inter-slide = consecutive scenes (sliding window), "
+        "all = run all three modes."
     ),
 )
 @click.option(
@@ -163,58 +226,38 @@ def _extract_for_video(
     type=float,
     default=DEFAULT_MIN_VIDEO_DURATION,
     show_default=True,
-    help="Minimum video duration in seconds. Videos shorter than this are skipped.",
+    help="Minimum video duration in seconds.",
+)
+@click.option(
+    "--max-pairs",
+    type=int,
+    default=None,
+    help="Maximum pairs per video (per mode). No limit if not set.",
 )
 @click.option(
     "--workers", "-w",
     type=int,
     default=None,
-    help="Number of parallel workers for scene detection. Defaults to CPU count - 2.",
+    help="Parallel workers for scene detection. Defaults to CPU count - 2.",
 )
-def main(input_path: Path, output: Path, mode: str, min_duration: float, workers: int | None):
-    """Extract frame pairs from video scenes for model training.
+def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None):
+    """Extract frame pairs from video scenes.
 
-    INPUT_PATH can be a directory of videos, a single video file, or a .txt
-    file with one directory path per line (lines starting with # are ignored).
+    INPUT_PATH can be a directory, a single video file, or a .txt file with
+    one directory path per line (lines starting with # are ignored).
     """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-
-    # Install Ctrl+C handler
-    STOP_EVENT.clear()
-    global _SIGINT_COUNT
-    with _SIGINT_LOCK:
-        _SIGINT_COUNT = 0
-    signal.signal(signal.SIGINT, _handle_sigint)
+    _init_signal_handler()
 
     input_path = Path(input_path).resolve()
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
 
-    if input_path.is_file() and input_path.suffix.lower() == ".txt":
-        lines = input_path.read_text(encoding="utf-8").splitlines()
-        videos = []
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            folder = _resolve_path_from_txt(line, input_path.parent)
-            if not folder.is_dir():
-                click.echo(f"Skipping (not a directory): {line} -> {folder}", err=True)
-                continue
-            videos.extend(_find_videos(folder, min_duration=min_duration))
-    elif input_path.is_file():
-        dur = _get_video_duration(input_path)
-        if dur < min_duration:
-            click.echo(f"Video too short ({dur:.1f}s < {min_duration:.1f}s min).", err=True)
-            raise SystemExit(1)
-        videos = [input_path]
-    else:
-        videos = _find_videos(input_path, min_duration=min_duration)
-
+    videos = _resolve_videos(input_path, min_duration)
     if not videos:
         click.echo("No video files found.", err=True)
         raise SystemExit(1)
@@ -223,25 +266,22 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
     max_workers = workers if workers else max(1, cpu_count - 2)
     max_workers = min(max_workers, len(videos))
 
-    click.echo(f"Found {len(videos)} video(s). Mode: {mode}. Workers: {max_workers}")
+    pairs_info = f" (max {max_pairs}/video)" if max_pairs else ""
+    click.echo(f"Found {len(videos)} video(s). Mode: {mode}. Workers: {max_workers}{pairs_info}")
 
-    # Global counters for continuous numbering across videos
     counters = {"intra": 0, "inter-seq": 0, "inter-slide": 0, "main": 0}
     total_pairs = 0
     processed = 0
 
-    # Buffer for detected scenes waiting for extraction (maintains order)
-    # We collect results as they finish, but extract in original video order
     pending_results: dict[Path, list[SceneBoundary]] = {}
-    next_video_idx = 0  # index into `videos` for the next video to extract
+    next_video_idx = 0
 
     def _flush_ready():
-        """Extract pairs for all videos that are ready in order."""
         nonlocal next_video_idx, total_pairs, processed
         while next_video_idx < len(videos) and videos[next_video_idx] in pending_results:
             video_path = videos[next_video_idx]
             scenes = pending_results.pop(video_path)
-            pairs = _extract_for_video(video_path, scenes, output, mode, counters)
+            pairs = _extract_for_video(video_path, scenes, output, mode, counters, max_pairs)
             total_pairs += pairs
             processed += 1
             next_video_idx += 1
@@ -284,7 +324,6 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
                 for f in futures:
                     f.cancel()
             executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
-            # Flush whatever is ready
             _flush_ready()
 
     if cancelled:
@@ -293,5 +332,148 @@ def main(input_path: Path, output: Path, mode: str, min_duration: float, workers
         click.echo(f"\nDone! {total_pairs} pairs from {len(videos)} videos -> {output}")
 
 
+# ---------------------------------------------------------------------------
+# clean command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--no-solid", is_flag=True, help="Skip solid-color removal.")
+@click.option("--no-duplicates", is_flag=True, help="Skip duplicate removal.")
+@click.option(
+    "--nsfw/--no-nsfw",
+    default=False,
+    show_default=True,
+    help="Enable NSFW filter (requires torch + transformers).",
+)
+@click.option(
+    "--keep-nsfw/--remove-nsfw",
+    default=True,
+    show_default=True,
+    help="Keep NSFW images (reverse filter) or remove them.",
+)
+@click.option("--nsfw-confidence", type=float, default=0.5, show_default=True, help="NSFW classification confidence threshold.")
+@click.option("--nsfw-batch-size", type=int, default=32, show_default=True, help="Batch size for NSFW inference.")
+@click.option("--nsfw-device", type=str, default=None, help="Device for NSFW model (cuda/cpu). Auto-detects if not set.")
+@click.option("--hash-threshold", type=int, default=12, show_default=True, help="Max hamming distance for duplicate detection (lower = stricter).")
+@click.option("--solid-threshold", type=float, default=12.0, show_default=True, help="Max std-dev per channel to consider solid color.")
+@click.option("--workers", "-w", type=int, default=8, show_default=True, help="Parallel workers for image processing.")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed without deleting.")
+def clean(
+    directory: Path,
+    no_solid: bool,
+    no_duplicates: bool,
+    nsfw: bool,
+    keep_nsfw: bool,
+    nsfw_confidence: float,
+    nsfw_batch_size: int,
+    nsfw_device: str | None,
+    hash_threshold: int,
+    solid_threshold: float,
+    workers: int,
+    dry_run: bool,
+):
+    """Clean image pairs: remove solid colors, duplicates, and optionally filter by NSFW.
+
+    DIRECTORY should contain image pairs named NNNNNN_A.jpg / NNNNNN_B.jpg.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    from .cleaner import clean_directory
+
+    directory = Path(directory).resolve()
+
+    if dry_run:
+        click.echo("[DRY RUN] No files will be deleted.")
+
+    stats = clean_directory(
+        directory,
+        remove_solid=not no_solid,
+        remove_dups=not no_duplicates,
+        nsfw=nsfw,
+        keep_nsfw=keep_nsfw,
+        nsfw_confidence=nsfw_confidence,
+        nsfw_batch_size=nsfw_batch_size,
+        nsfw_device=nsfw_device,
+        hash_threshold=hash_threshold,
+        solid_threshold=solid_threshold,
+        workers=workers,
+        dry_run=dry_run,
+    )
+
+    click.echo(f"\n--- Cleaning summary ---")
+    click.echo(f"  Solid color pairs removed: {stats['solid_removed']}")
+    click.echo(f"  Duplicate pairs removed:   {stats['duplicates_removed']}")
+    if nsfw:
+        click.echo(f"  NSFW filtered pairs:       {stats['nsfw_removed']}")
+    click.echo(f"  Orphan pairs removed:      {stats['orphans_removed']}")
+    click.echo(f"  Total removed:             {stats['total_removed']}")
+    click.echo(f"  Remaining pairs:           {stats['remaining']}")
+
+
+# ---------------------------------------------------------------------------
+# depth command
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--percentage", "-p", type=float, default=100.0, show_default=True, help="Percentage of _A images to process (0-100).")
+@click.option("--batch-size", "-b", type=int, default=8, show_default=True, help="Batch size for GPU inference.")
+@click.option("--device", type=str, default=None, help="Device for inference (cuda/cpu). Auto-detects if not set.")
+@click.option(
+    "--model", "-m",
+    type=str,
+    default="large",
+    show_default=True,
+    help="Model preset (small/base/large) or full HuggingFace model ID.",
+)
+@click.option("--seed", type=int, default=None, help="Random seed for reproducible subset selection.")
+def depth(
+    directory: Path,
+    percentage: float,
+    batch_size: int,
+    device: str | None,
+    model: str,
+    seed: int | None,
+):
+    """Generate depth maps for _A images, saved as _C.jpg.
+
+    DIRECTORY should contain image pairs named NNNNNN_A.jpg / NNNNNN_B.jpg.
+    Depth maps are generated from _A images using Depth Anything V2.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    from .depth import generate_depth_maps
+
+    directory = Path(directory).resolve()
+
+    count = generate_depth_maps(
+        directory,
+        percentage=percentage,
+        batch_size=batch_size,
+        device=device,
+        model=model,
+        seed=seed,
+    )
+
+    click.echo(f"\nDone! Generated {count} depth maps -> {directory}")
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible entry point: `sceneframe` without subcommand = extract
+# ---------------------------------------------------------------------------
+
+# Keep `main` as an alias so `python -m sceneframe.cli` still works
+main = cli
+
+
 if __name__ == "__main__":
-    main()
+    cli()

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sceneframe"
-version = "0.1.0"
+version = "0.2.0"
 description = "Detect video scenes and extract frame pairs for model training"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,8 +15,15 @@ dependencies = [
     "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+gpu = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "Pillow>=10.0",
+]
+
 [project.scripts]
-sceneframe = "sceneframe.cli:main"
+sceneframe = "sceneframe.cli:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sceneframe"]

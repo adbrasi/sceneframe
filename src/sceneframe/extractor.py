@@ -55,6 +55,7 @@ def extract_intra_scene_pairs(
     scenes: list[SceneBoundary],
     output_dir: Path,
     start_index: int = 0,
+    max_pairs: int | None = None,
 ) -> int:
     """Mode 1: Extract first and last frame of each scene as pairs.
 
@@ -73,6 +74,9 @@ def extract_intra_scene_pairs(
 
     try:
         for scene in scenes:
+            if max_pairs is not None and pair_count >= max_pairs:
+                break
+
             indices = _safe_frame_indices(scene)
             if indices is None:
                 continue
@@ -104,6 +108,7 @@ def extract_inter_scene_pairs_sequential(
     scenes: list[SceneBoundary],
     output_dir: Path,
     start_index: int = 0,
+    max_pairs: int | None = None,
 ) -> int:
     """Mode 2a: Pair first frames of consecutive scenes (no overlap).
 
@@ -123,6 +128,9 @@ def extract_inter_scene_pairs_sequential(
 
     try:
         for i in range(0, len(scenes) - 1, 2):
+            if max_pairs is not None and pair_count >= max_pairs:
+                break
+
             scene_a = scenes[i]
             scene_b = scenes[i + 1]
 
@@ -159,6 +167,7 @@ def extract_inter_scene_pairs_sliding(
     scenes: list[SceneBoundary],
     output_dir: Path,
     start_index: int = 0,
+    max_pairs: int | None = None,
 ) -> int:
     """Mode 2b: Pair first frames of consecutive scenes (sliding window).
 
@@ -180,6 +189,9 @@ def extract_inter_scene_pairs_sliding(
 
     try:
         for i in range(len(scenes) - 1):
+            if max_pairs is not None and pair_count >= max_pairs:
+                break
+
             scene_a = scenes[i]
             scene_b = scenes[i + 1]
 
