@@ -4,7 +4,7 @@ from pathlib import Path
 
 from sceneframe.cleaner import (
     is_solid_color,
-    _compute_dhash_bytes,
+    _compute_feature_vector,
     scan_pairs,
     find_solid_color_labels,
     find_duplicate_labels,
@@ -61,29 +61,41 @@ class TestIsSolidColor:
         assert is_solid_color(None) is True
 
 
-class TestDhash:
-    def test_identical_images_same_hash(self):
+class TestFeatureVector:
+    def test_identical_images_same_vector(self):
         img = _make_noisy_image(seed=1)
-        h1 = _compute_dhash_bytes(img)
-        h2 = _compute_dhash_bytes(img)
-        assert h1 == h2
+        v1 = _compute_feature_vector(img)
+        v2 = _compute_feature_vector(img)
+        np.testing.assert_array_almost_equal(v1, v2)
 
-    def test_different_images_different_hash(self):
-        h1 = _compute_dhash_bytes(_make_noisy_image(seed=1))
-        h2 = _compute_dhash_bytes(_make_noisy_image(seed=2))
-        assert h1 != h2
+    def test_different_images_different_vector(self):
+        v1 = _compute_feature_vector(_make_noisy_image(seed=1))
+        v2 = _compute_feature_vector(_make_noisy_image(seed=2))
+        similarity = np.dot(v1, v2)
+        assert similarity < 0.99  # different images should not be identical
 
-    def test_hash_length(self):
+    def test_vector_is_normalized(self):
+        img = _make_noisy_image(seed=1)
+        v = _compute_feature_vector(img)
+        norm = np.linalg.norm(v)
+        assert abs(norm - 1.0) < 1e-4
+
+    def test_vector_length(self):
         img = _make_noisy_image()
-        h = _compute_dhash_bytes(img, hash_size=16)
-        # 16*16 = 256 bits = 32 bytes
-        assert len(h) == 32
+        v = _compute_feature_vector(img)
+        # 64*64 = 4096 features
+        assert len(v) == 64 * 64
 
-    def test_hash_length_small(self):
-        img = _make_noisy_image()
-        h = _compute_dhash_bytes(img, hash_size=8)
-        # 8*8 = 64 bits = 8 bytes
-        assert len(h) == 8
+    def test_nearly_identical_images_high_similarity(self):
+        """An image with tiny noise added should have high cosine similarity."""
+        img1 = _make_noisy_image(seed=1, size=(128, 128))
+        img2 = img1.copy()
+        # Add very small perturbation (like an eye blink)
+        img2[50:55, 50:55] = np.clip(img2[50:55, 50:55].astype(np.int16) + 10, 0, 255).astype(np.uint8)
+        v1 = _compute_feature_vector(img1)
+        v2 = _compute_feature_vector(img2)
+        similarity = np.dot(v1, v2)
+        assert similarity > 0.96  # should be caught as duplicate
 
 
 class TestScanPairs:
@@ -137,9 +149,25 @@ class TestFindDuplicateLabels:
         _save_test_image(tmp_path / "000003_A.jpg", img1)  # same as 000001_A
         _save_test_image(tmp_path / "000003_B.jpg", img2)
 
-        labels = find_duplicate_labels(tmp_path, threshold=12, workers=1)
+        labels = find_duplicate_labels(tmp_path, similarity=0.96, workers=1)
         # 000003 should be marked as duplicate of 000001
         assert "000003" in labels
+        assert "000001" not in labels
+
+    def test_nearly_identical_detected(self, tmp_path):
+        """Frames with tiny differences (eye blink level) should be caught."""
+        img1 = _make_noisy_image(seed=1, size=(128, 128))
+        img2 = img1.copy()
+        # Small perturbation — like an eye blink in a small region
+        img2[50:55, 50:55] = np.clip(img2[50:55, 50:55].astype(np.int16) + 10, 0, 255).astype(np.uint8)
+
+        _save_test_image(tmp_path / "000001_A.jpg", img1)
+        _save_test_image(tmp_path / "000001_B.jpg", img1)
+        _save_test_image(tmp_path / "000002_A.jpg", img2)
+        _save_test_image(tmp_path / "000002_B.jpg", img2)
+
+        labels = find_duplicate_labels(tmp_path, similarity=0.96, workers=1)
+        assert "000002" in labels
         assert "000001" not in labels
 
     def test_no_duplicates(self, tmp_path):
@@ -148,7 +176,7 @@ class TestFindDuplicateLabels:
             _save_test_image(tmp_path / f"{i + 1:06d}_A.jpg", img)
             _save_test_image(tmp_path / f"{i + 1:06d}_B.jpg", img)
 
-        labels = find_duplicate_labels(tmp_path, threshold=12, workers=1)
+        labels = find_duplicate_labels(tmp_path, similarity=0.96, workers=1)
         assert len(labels) == 0
 
 

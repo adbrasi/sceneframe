@@ -79,33 +79,45 @@ def find_solid_color_labels(
 
 
 # ---------------------------------------------------------------------------
-# Perceptual duplicate detection (dhash)
+# Duplicate detection (cosine similarity on downscaled pixels)
 # ---------------------------------------------------------------------------
 
-def _compute_dhash_bytes(image: np.ndarray, hash_size: int = 16) -> bytes:
-    """Compute difference hash as raw bytes. Returns hash_size*hash_size/8 bytes."""
-    resized = cv2.resize(image, (hash_size + 1, hash_size))
+_FEATURE_SIZE = 64  # Downscale images to 64x64 grayscale for comparison
+
+
+def _compute_feature_vector(image: np.ndarray) -> np.ndarray:
+    """Downscale image to a grayscale feature vector for similarity comparison."""
+    resized = cv2.resize(image, (_FEATURE_SIZE, _FEATURE_SIZE))
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if resized.ndim == 3 else resized
-    diff = gray[:, 1:] > gray[:, :-1]
-    return np.packbits(diff.flatten()).tobytes()
+    vec = gray.flatten().astype(np.float32)
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        vec /= norm
+    return vec
 
 
 def find_duplicate_labels(
     directory: Path,
-    hash_size: int = 16,
-    threshold: int = 12,
+    similarity: float = 0.96,
     workers: int = 8,
+    chunk_size: int = 1000,
 ) -> set[str]:
-    """Find duplicate pairs by comparing _A images using dhash.
+    """Find duplicate pairs by comparing _A images using cosine similarity.
+
+    Downscales each image to 64x64 grayscale, normalizes, and computes
+    cosine similarity via matrix multiplication in chunks. This catches
+    near-identical frames (eye blinks, slight movements, compression diffs).
 
     Parameters
     ----------
-    hash_size : int
-        Hash grid size. 16 → 256-bit hash (32 bytes). Higher = more precise.
-    threshold : int
-        Maximum hamming distance to consider a duplicate.
-        With hash_size=16 (256 bits), threshold=12 ≈ 95% similarity.
-        Common values: 8 (97%), 12 (95%), 16 (94%).
+    similarity : float
+        Minimum cosine similarity to consider a duplicate (0-1).
+        0.96 = very similar (eye blink, slight movement).
+        0.98 = nearly identical (compression artifacts only).
+        0.93 = moderately similar (small pose changes).
+    chunk_size : int
+        Number of images per chunk for similarity computation.
+        Controls memory usage: chunk_size * N * 4 bytes per chunk.
     """
     pairs = scan_pairs(directory)
 
@@ -119,33 +131,58 @@ def find_duplicate_labels(
     if len(paths) < 2:
         return set()
 
-    # Compute hashes in parallel
-    def _hash(path: Path) -> bytes:
+    # Compute feature vectors in parallel
+    def _featurize(path: Path) -> np.ndarray:
         img = cv2.imread(str(path))
         if img is None:
-            return b"\x00" * (hash_size * hash_size // 8)
-        return _compute_dhash_bytes(img, hash_size)
+            return np.zeros(_FEATURE_SIZE * _FEATURE_SIZE, dtype=np.float32)
+        return _compute_feature_vector(img)
 
-    raw_hashes: list[bytes] = []
+    vectors: list[np.ndarray] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        raw_hashes = list(tqdm(pool.map(_hash, paths), total=len(paths), desc="Hashing"))
+        vectors = list(tqdm(pool.map(_featurize, paths), total=len(paths), desc="Featurizing"))
 
-    # Build numpy array for vectorized comparison
-    hash_len = len(raw_hashes[0])
-    hash_array = np.frombuffer(b"".join(raw_hashes), dtype=np.uint8).reshape(len(raw_hashes), hash_len)
+    # Stack into matrix: (N, feature_dim)
+    features = np.vstack(vectors)  # (N, 4096) float32
+    n = len(features)
 
-    # Greedy duplicate detection: for each image, mark all near-duplicates
-    n = len(hash_array)
+    # Greedy dedup via chunked cosine similarity (matrix multiplication)
     to_remove_idx: set[int] = set()
 
-    for i in tqdm(range(n), desc="Deduplicating"):
-        if i in to_remove_idx:
-            continue
-        # Vectorized hamming distance: XOR + popcount
-        xor = hash_array[i] ^ hash_array[i + 1:]  # (remaining, hash_len)
-        distances = _POPCOUNT_TABLE[xor].sum(axis=1)  # (remaining,)
-        dups = np.where(distances <= threshold)[0] + i + 1
-        to_remove_idx.update(dups.tolist())
+    for start in tqdm(range(0, n, chunk_size), desc="Deduplicating"):
+        end = min(start + chunk_size, n)
+        chunk = features[start:end]  # (chunk, dim)
+
+        # Compare chunk against all images after it
+        # Only check forward to avoid double-counting
+        remaining = features[start + 1:]  # (N - start - 1, dim)
+        if remaining.shape[0] == 0:
+            break
+
+        # Cosine similarity via dot product (vectors are pre-normalized)
+        sim_matrix = chunk @ remaining.T  # (chunk, N - start - 1)
+
+        for local_i in range(end - start):
+            global_i = start + local_i
+            if global_i in to_remove_idx:
+                continue
+
+            # Similarities for this image against all after it
+            # Offset: local_i maps to comparisons starting at (global_i + 1)
+            # In sim_matrix row local_i, column 0 = global_i+1, column 1 = global_i+2, etc.
+            # But we computed against features[start+1:], so column offset depends on local_i
+            col_offset = local_i  # first local_i columns are within-chunk (before global_i+1 relative to start+1)
+            # Actually: remaining starts at start+1. Image global_i compares against start+1..N-1.
+            # Column j in sim_matrix[local_i] corresponds to global index (start + 1 + j).
+            # We only want columns where global index > global_i, i.e. j > global_i - start - 1 = local_i - 1
+            # So we want columns from local_i onward.
+            row_sims = sim_matrix[local_i, local_i:]  # similarities against images after global_i
+            dup_cols = np.where(row_sims >= similarity)[0]
+            # Map back to global indices: global_i + 1 + dup_col
+            for dc in dup_cols:
+                dup_global = global_i + 1 + dc
+                if dup_global not in to_remove_idx:
+                    to_remove_idx.add(dup_global)
 
     return {labels[i] for i in to_remove_idx}
 
@@ -247,7 +284,7 @@ def clean_directory(
     nsfw_confidence: float = 0.5,
     nsfw_batch_size: int = 32,
     nsfw_device: str | None = None,
-    hash_threshold: int = 12,
+    similarity: float = 0.96,
     solid_threshold: float = 12.0,
     workers: int = 8,
     dry_run: bool = False,
@@ -282,7 +319,7 @@ def clean_directory(
 
     # Step 2: duplicates
     if remove_dups:
-        dups = find_duplicate_labels(directory, threshold=hash_threshold, workers=workers)
+        dups = find_duplicate_labels(directory, similarity=similarity, workers=workers)
         new_dups = dups - all_to_remove
         stats["duplicates_removed"] = len(new_dups)
         all_to_remove.update(dups)

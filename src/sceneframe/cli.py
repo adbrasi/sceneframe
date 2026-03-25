@@ -355,7 +355,7 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
 @click.option("--nsfw-confidence", type=float, default=0.5, show_default=True, help="NSFW classification confidence threshold.")
 @click.option("--nsfw-batch-size", type=int, default=32, show_default=True, help="Batch size for NSFW inference.")
 @click.option("--nsfw-device", type=str, default=None, help="Device for NSFW model (cuda/cpu). Auto-detects if not set.")
-@click.option("--hash-threshold", type=int, default=12, show_default=True, help="Max hamming distance for duplicate detection (lower = stricter).")
+@click.option("--similarity", type=float, default=0.96, show_default=True, help="Min cosine similarity for duplicate detection (0-1). Higher = stricter.")
 @click.option("--solid-threshold", type=float, default=12.0, show_default=True, help="Max std-dev per channel to consider solid color.")
 @click.option("--workers", "-w", type=int, default=8, show_default=True, help="Parallel workers for image processing.")
 @click.option("--dry-run", is_flag=True, help="Show what would be removed without deleting.")
@@ -368,7 +368,7 @@ def clean(
     nsfw_confidence: float,
     nsfw_batch_size: int,
     nsfw_device: str | None,
-    hash_threshold: int,
+    similarity: float,
     solid_threshold: float,
     workers: int,
     dry_run: bool,
@@ -399,7 +399,7 @@ def clean(
         nsfw_confidence=nsfw_confidence,
         nsfw_batch_size=nsfw_batch_size,
         nsfw_device=nsfw_device,
-        hash_threshold=hash_threshold,
+        similarity=similarity,
         solid_threshold=solid_threshold,
         workers=workers,
         dry_run=dry_run,
@@ -440,10 +440,10 @@ def depth(
     model: str,
     seed: int | None,
 ):
-    """Generate depth maps for _A images, saved as _C.jpg.
+    """Generate depth maps for _B images, saved as _C.jpg.
 
     DIRECTORY should contain image pairs named NNNNNN_A.jpg / NNNNNN_B.jpg.
-    Depth maps are generated from _A images using Depth Anything V2.
+    Depth maps are generated from _B images using Depth Anything V2.
     """
     logging.basicConfig(
         level=logging.INFO,

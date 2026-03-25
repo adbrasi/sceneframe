@@ -1,4 +1,4 @@
-"""Depth map generation for image pairs using monocular depth estimation.
+"""Depth map generation for _B images using monocular depth estimation.
 
 Uses Depth Anything V2 with direct model inference (AutoModelForDepthEstimation)
 for maximum GPU throughput with FP16 and batched tensors.
@@ -31,7 +31,7 @@ def generate_depth_maps(
     model: str = "large",
     seed: int | None = None,
 ) -> int:
-    """Generate depth maps for _A images, saved as _C.jpg.
+    """Generate depth maps for _B images, saved as _C.jpg.
 
     Uses AutoModelForDepthEstimation with FP16 for optimal GPU throughput
     instead of the generic pipeline. Processes images in batched tensors
@@ -42,7 +42,7 @@ def generate_depth_maps(
     input_dir : Path
         Directory containing image pairs (*_A.jpg, *_B.jpg).
     percentage : float
-        Percentage of _A images to generate depth maps for (0-100).
+        Percentage of _B images to generate depth maps for (0-100).
     batch_size : int
         Batch size for GPU inference. Higher = faster on GPUs with more VRAM.
         Recommended: 16-32 for 24GB, 32-64 for 48GB+.
@@ -73,11 +73,11 @@ def generate_depth_maps(
 
     use_fp16 = device == "cuda"
 
-    # Find _A images without existing _C depth maps
-    a_files = sorted(input_dir.glob("*_A.jpg"))
+    # Find _B images without existing _C depth maps
+    b_files = sorted(input_dir.glob("*_B.jpg"))
     candidates = [
-        f for f in a_files
-        if not (f.parent / f.name.replace("_A.jpg", "_C.jpg")).exists()
+        f for f in b_files
+        if not (f.parent / f.name.replace("_B.jpg", "_C.jpg")).exists()
     ]
 
     if not candidates:
@@ -141,7 +141,7 @@ def generate_depth_maps(
             else:
                 depth_norm = np.zeros_like(depth_np, dtype=np.uint8)
 
-            c_path = path.parent / path.name.replace("_A.jpg", "_C.jpg")
+            c_path = path.parent / path.name.replace("_B.jpg", "_C.jpg")
             cv2.imwrite(str(c_path), depth_norm, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             saved += 1
 
