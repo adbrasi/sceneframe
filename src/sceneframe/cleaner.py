@@ -200,10 +200,13 @@ def find_nsfw_labels(
 ) -> set[str]:
     """Filter images by NSFW content using Falconsai/nsfw_image_detection.
 
+    Checks BOTH _A and _B images for each pair. A pair is considered NSFW
+    if ANY of its images is classified as NSFW.
+
     Parameters
     ----------
     keep_nsfw : bool
-        If True (default), keep NSFW images and remove SFW ones (reverse filter).
+        If True (default), keep NSFW pairs and remove SFW ones (reverse filter).
     confidence : float
         Minimum confidence to classify as NSFW.
     """
@@ -223,14 +226,17 @@ def find_nsfw_labels(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     pairs = scan_pairs(directory)
-    labels: list[str] = []
-    paths: list[Path] = []
-    for label, files in sorted(pairs.items()):
-        if "A" in files:
-            labels.append(label)
-            paths.append(files["A"])
 
-    if not paths:
+    # Collect all images (A and B) for classification
+    all_labels: list[str] = []
+    all_paths: list[Path] = []
+    for label, files in sorted(pairs.items()):
+        for suffix in ("A", "B"):
+            if suffix in files:
+                all_labels.append(label)
+                all_paths.append(files[suffix])
+
+    if not all_paths:
         return set()
 
     classifier = pipeline(
@@ -240,25 +246,29 @@ def find_nsfw_labels(
         batch_size=batch_size,
     )
 
-    to_remove: set[str] = set()
+    # Track which labels have at least one NSFW image
+    nsfw_labels: set[str] = set()
 
-    for i in tqdm(range(0, len(paths), batch_size), desc="NSFW filter"):
-        batch_paths = paths[i : i + batch_size]
-        batch_labels = labels[i : i + batch_size]
+    for i in tqdm(range(0, len(all_paths), batch_size), desc="NSFW filter"):
+        batch_paths = all_paths[i : i + batch_size]
+        batch_labels = all_labels[i : i + batch_size]
         images = [Image.open(p).convert("RGB") for p in batch_paths]
 
         results = classifier(images)
 
         for label, result in zip(batch_labels, results):
             top = max(result, key=lambda x: x["score"])
-            is_nsfw = top["label"] == "nsfw" and top["score"] >= confidence
+            if top["label"] == "nsfw" and top["score"] >= confidence:
+                nsfw_labels.add(label)
 
-            if keep_nsfw and not is_nsfw:
-                to_remove.add(label)
-            elif not keep_nsfw and is_nsfw:
-                to_remove.add(label)
-
-    return to_remove
+    # Decide which pairs to remove based on mode
+    all_pair_labels = set(pairs.keys())
+    if keep_nsfw:
+        # Keep NSFW, remove SFW (pairs with NO nsfw image)
+        return all_pair_labels - nsfw_labels
+    else:
+        # Remove NSFW
+        return nsfw_labels
 
 
 # ---------------------------------------------------------------------------
