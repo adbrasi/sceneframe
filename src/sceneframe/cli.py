@@ -416,34 +416,47 @@ def clean(
 
 
 # ---------------------------------------------------------------------------
-# depth command
+# control command (depth + canny)
 # ---------------------------------------------------------------------------
 
 @cli.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--percentage", "-p", type=float, default=100.0, show_default=True, help="Percentage of _A images to process (0-100).")
-@click.option("--batch-size", "-b", type=int, default=8, show_default=True, help="Batch size for GPU inference.")
-@click.option("--device", type=str, default=None, help="Device for inference (cuda/cpu). Auto-detects if not set.")
+@click.option("--depth-pct", type=float, default=0.0, show_default=True, help="Percentage of _B images to get depth maps (0-100).")
+@click.option("--canny-pct", type=float, default=0.0, show_default=True, help="Percentage of _B images to get canny edge maps (0-100).")
+@click.option("--batch-size", "-b", type=int, default=8, show_default=True, help="Batch size for depth GPU inference.")
+@click.option("--device", type=str, default=None, help="Device for depth inference (cuda/cpu). Auto-detects if not set.")
 @click.option(
     "--model", "-m",
     type=str,
     default="large",
     show_default=True,
-    help="Model preset (small/base/large) or full HuggingFace model ID.",
+    help="Depth model preset (small/base/large) or full HuggingFace model ID.",
 )
+@click.option("--canny-low", type=int, default=100, show_default=True, help="Canny lower threshold.")
+@click.option("--canny-high", type=int, default=200, show_default=True, help="Canny upper threshold.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducible subset selection.")
-def depth(
+def control(
     directory: Path,
-    percentage: float,
+    depth_pct: float,
+    canny_pct: float,
     batch_size: int,
     device: str | None,
     model: str,
+    canny_low: int,
+    canny_high: int,
     seed: int | None,
 ):
-    """Generate depth maps for _B images, saved as _C.jpg.
+    """Generate control images (_C.jpg) from _B images using depth and/or canny.
 
     DIRECTORY should contain image pairs named NNNNNN_A.jpg / NNNNNN_B.jpg.
-    Depth maps are generated from _B images using Depth Anything V2.
+    Each _B image is assigned to either depth or canny (not both).
+    The sum of --depth-pct and --canny-pct determines the total % of _C images created.
+
+    \b
+    Examples:
+      sceneframe control ./output --depth-pct 30 --canny-pct 20
+      sceneframe control ./output --depth-pct 100
+      sceneframe control ./output --canny-pct 50
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -451,20 +464,68 @@ def depth(
         datefmt="%H:%M:%S",
     )
 
-    from .depth import generate_depth_maps
+    if depth_pct <= 0 and canny_pct <= 0:
+        click.echo("Error: specify at least one of --depth-pct or --canny-pct > 0.", err=True)
+        raise SystemExit(1)
+
+    if depth_pct + canny_pct > 100:
+        click.echo(f"Error: --depth-pct ({depth_pct}) + --canny-pct ({canny_pct}) exceeds 100%.", err=True)
+        raise SystemExit(1)
+
+    from .depth import _get_candidates, _select_subset, generate_canny_maps, generate_depth_maps
 
     directory = Path(directory).resolve()
+    all_candidates = _get_candidates(directory)
 
-    count = generate_depth_maps(
-        directory,
-        percentage=percentage,
-        batch_size=batch_size,
-        device=device,
-        model=model,
-        seed=seed,
-    )
+    if not all_candidates:
+        click.echo("No _B images without existing _C found.")
+        raise SystemExit(0)
 
-    click.echo(f"\nDone! Generated {count} depth maps -> {directory}")
+    click.echo(f"Found {len(all_candidates)} _B images without _C")
+
+    import random
+
+    total_count = len(all_candidates)
+    remaining = list(all_candidates)
+
+    # Select depth candidates first
+    depth_candidates = []
+    if depth_pct > 0:
+        depth_count = max(1, int(total_count * depth_pct / 100.0))
+        if seed is not None:
+            random.seed(seed)
+        depth_candidates = sorted(random.sample(remaining, min(depth_count, len(remaining))))
+        remaining = [f for f in remaining if f not in set(depth_candidates)]
+
+    # Select canny candidates from remaining
+    canny_candidates = []
+    if canny_pct > 0 and remaining:
+        canny_count = max(1, int(total_count * canny_pct / 100.0))
+        if seed is not None:
+            random.seed(seed + 1)
+        canny_candidates = sorted(random.sample(remaining, min(canny_count, len(remaining))))
+
+    depth_saved = 0
+    canny_saved = 0
+
+    if depth_candidates:
+        click.echo(f"Generating {len(depth_candidates)} depth maps...")
+        depth_saved = generate_depth_maps(
+            depth_candidates,
+            batch_size=batch_size,
+            device=device,
+            model=model,
+        )
+
+    if canny_candidates:
+        click.echo(f"Generating {len(canny_candidates)} canny edge maps...")
+        canny_saved = generate_canny_maps(
+            canny_candidates,
+            low_threshold=canny_low,
+            high_threshold=canny_high,
+        )
+
+    click.echo(f"\nDone! Generated {depth_saved} depth + {canny_saved} canny = {depth_saved + canny_saved} control maps -> {directory}")
 
 
 # ---------------------------------------------------------------------------

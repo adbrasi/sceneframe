@@ -1,7 +1,10 @@
-"""Depth map generation for _B images using monocular depth estimation.
+"""Control image generation for _B images (depth maps and canny edge detection).
 
-Uses Depth Anything V2 with direct model inference (AutoModelForDepthEstimation)
-for maximum GPU throughput with FP16 and batched tensors.
+Supports:
+- Depth maps via Depth Anything V2 (GPU, batched FP16 inference)
+- Canny edge detection via OpenCV (CPU, very fast)
+
+Both are saved as _C.jpg alongside the source _B.jpg.
 """
 
 import logging
@@ -23,13 +26,73 @@ MODEL_PRESETS = {
 }
 
 
+def _get_candidates(input_dir: Path) -> list[Path]:
+    """Find _B images without existing _C control maps."""
+    b_files = sorted(input_dir.glob("*_B.jpg"))
+    return [
+        f for f in b_files
+        if not (f.parent / f.name.replace("_B.jpg", "_C.jpg")).exists()
+    ]
+
+
+def _select_subset(
+    candidates: list[Path], percentage: float, seed: int | None = None,
+) -> list[Path]:
+    """Select a random percentage-based subset of candidates."""
+    if percentage >= 100.0 or not candidates:
+        return candidates
+    if seed is not None:
+        random.seed(seed)
+    count = max(1, int(len(candidates) * percentage / 100.0))
+    return sorted(random.sample(candidates, count))
+
+
+def generate_canny_maps(
+    candidates: list[Path],
+    low_threshold: int = 100,
+    high_threshold: int = 200,
+) -> int:
+    """Generate Canny edge maps for _B images, saved as _C.jpg.
+
+    Pure OpenCV, no GPU required. Very fast.
+
+    Parameters
+    ----------
+    candidates : list[Path]
+        List of _B.jpg files to process.
+    low_threshold : int
+        Canny lower threshold.
+    high_threshold : int
+        Canny upper threshold.
+
+    Returns
+    -------
+    int
+        Number of canny maps generated.
+    """
+    if not candidates:
+        return 0
+
+    logger.info("Generating canny edge maps for %d images", len(candidates))
+    saved = 0
+
+    for path in tqdm(candidates, desc="Canny maps"):
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        edges = cv2.Canny(img, low_threshold, high_threshold)
+        c_path = path.parent / path.name.replace("_B.jpg", "_C.jpg")
+        cv2.imwrite(str(c_path), edges, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        saved += 1
+
+    return saved
+
+
 def generate_depth_maps(
-    input_dir: Path,
-    percentage: float = 100.0,
+    candidates: list[Path],
     batch_size: int = 8,
     device: str | None = None,
     model: str = "large",
-    seed: int | None = None,
 ) -> int:
     """Generate depth maps for _B images, saved as _C.jpg.
 
@@ -39,10 +102,8 @@ def generate_depth_maps(
 
     Parameters
     ----------
-    input_dir : Path
-        Directory containing image pairs (*_A.jpg, *_B.jpg).
-    percentage : float
-        Percentage of _B images to generate depth maps for (0-100).
+    candidates : list[Path]
+        List of _B.jpg files to process.
     batch_size : int
         Batch size for GPU inference. Higher = faster on GPUs with more VRAM.
         Recommended: 16-32 for 24GB, 32-64 for 48GB+.
@@ -50,14 +111,15 @@ def generate_depth_maps(
         Device for inference ("cuda", "cpu"). Auto-detects if None.
     model : str
         Model preset name ("small", "base", "large") or full HuggingFace model ID.
-    seed : int or None
-        Random seed for reproducible subset selection.
 
     Returns
     -------
     int
         Number of depth maps generated.
     """
+    if not candidates:
+        return 0
+
     try:
         import torch
         from PIL import Image
@@ -72,24 +134,6 @@ def generate_depth_maps(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     use_fp16 = device == "cuda"
-
-    # Find _B images without existing _C depth maps
-    b_files = sorted(input_dir.glob("*_B.jpg"))
-    candidates = [
-        f for f in b_files
-        if not (f.parent / f.name.replace("_B.jpg", "_C.jpg")).exists()
-    ]
-
-    if not candidates:
-        logger.info("No new depth maps to generate (all _A files already have _C)")
-        return 0
-
-    # Random subset selection
-    if percentage < 100.0:
-        if seed is not None:
-            random.seed(seed)
-        count = max(1, int(len(candidates) * percentage / 100.0))
-        candidates = sorted(random.sample(candidates, count))
 
     logger.info("Generating depth maps for %d images", len(candidates))
 
