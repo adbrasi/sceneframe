@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import random
 import secrets
 import shutil
@@ -25,12 +26,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+
+import urllib3
 
 API_BASE = "https://api.rule34.xxx/index.php"
 DEFAULT_RULE34_API_KEY = os.environ.get("RULE34_API_KEY", "")
 DEFAULT_RULE34_USER_ID = os.environ.get("RULE34_USER_ID", "")
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".m4v"}
+# Connection pools with keep-alive for maximum throughput on high-bandwidth links.
+_API_POOL = urllib3.HTTPSPoolManager(
+    num_pools=4,
+    maxsize=64,
+    retries=False,
+    headers={"User-Agent": "rule34-media-downloader/1.0"},
+)
+_CDN_POOL = urllib3.HTTPSPoolManager(
+    num_pools=16,
+    maxsize=512,
+    retries=False,
+    headers={"User-Agent": "rule34-image-downloader/1.0"},
+)
 STOP_EVENT = threading.Event()
 _SIGINT_COUNT = 0
 _SIGINT_LOCK = threading.Lock()
@@ -95,12 +110,13 @@ def http_get_raw(
     last_body: Optional[str] = None
     for attempt in range(1, retries + 1):
         try:
-            req = Request(url, headers={"User-Agent": "rule34-media-downloader/1.0"})
-            with urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
+            resp = _API_POOL.request("GET", url, timeout=timeout, preload_content=True)
+            raw = resp.data.decode("utf-8")
             last_body = raw[:2000] if raw else None
             if not raw:
                 raise RuntimeError("Empty response body")
+            if resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status}")
             if raw.lstrip().startswith("{"):
                 data = json.loads(raw)
                 if isinstance(data, dict) and data.get("success") is False:
@@ -189,7 +205,6 @@ def iter_posts_by_tags(tags: str, cfg: FetchConfig, deleted: bool = False) -> It
         if len(data) < limit:
             break
         page += 1
-        time.sleep(0.2)
 
 
 def load_tag_lines(path: Path) -> List[str]:
@@ -496,25 +511,25 @@ def download_job(
     tmp_path = image_path.with_suffix(image_path.suffix + ".part")
     start = time.time()
     total_bytes = 0
+    resp = None
     try:
-        req = Request(url, headers={"User-Agent": "rule34-image-downloader/1.0"})
-        with urlopen(req, timeout=timeout) as resp, tmp_path.open("wb") as f:
-            content_length = resp.headers.get("Content-Length") or resp.headers.get("content-length")
-            if content_length:
-                try:
-                    size = int(content_length)
-                except Exception:
-                    size = 0
-                if max_bytes and size > max_bytes:
-                    return False, 0, time.time() - start, f"Skipped: size {size} bytes exceeds max limit"
-                if min_bytes and size > 0 and size < min_bytes:
-                    return False, 0, time.time() - start, f"Skipped: size {size} bytes below min limit"
-            while True:
+        resp = _CDN_POOL.request("GET", url, timeout=timeout, preload_content=False)
+        if resp.status >= 400:
+            raise RuntimeError(f"HTTP {resp.status}")
+        content_length = resp.headers.get("Content-Length")
+        if content_length:
+            try:
+                size = int(content_length)
+            except Exception:
+                size = 0
+            if max_bytes and size > max_bytes:
+                return False, 0, time.time() - start, f"Skipped: size {size} bytes exceeds max limit"
+            if min_bytes and size > 0 and size < min_bytes:
+                return False, 0, time.time() - start, f"Skipped: size {size} bytes below min limit"
+        with tmp_path.open("wb") as f:
+            for chunk in resp.stream(chunk_bytes):
                 if STOP_EVENT.is_set():
                     raise RuntimeError("Interrupted")
-                chunk = resp.read(chunk_bytes)
-                if not chunk:
-                    break
                 f.write(chunk)
                 total_bytes += len(chunk)
                 if max_bytes and total_bytes > max_bytes:
@@ -544,6 +559,9 @@ def download_job(
             except Exception:
                 pass
         return False, total_bytes, time.time() - start, str(exc)
+    finally:
+        if resp is not None:
+            resp.release_conn()
 
 
 def iter_candidate_posts(tags: str, cfg: FetchConfig, max_posts: int) -> Iterable[dict]:
@@ -597,50 +615,58 @@ def download_for_line(
         tags_query = f"{tags_query} {sort}".strip()
 
     max_posts = max(remaining * candidate_factor, remaining)
-    candidates: List[Tuple[str, str, str, str]] = []
-    for post in iter_candidate_posts(tags_query, cfg, max_posts):
-        url = pick_post_url(post, use_sample)
-        if not url:
-            continue
-        candidate_id = str(post.get("id") or url)
-        if ids_lock:
-            with ids_lock:
-                if candidate_id in downloaded_ids:
-                    continue
-        elif candidate_id in downloaded_ids:
-            continue
-        ext = infer_extension(url)
-        if allowed_exts and ext.lower() not in allowed_exts:
-            continue
-        post_tags = (post.get("tags") or "").strip()
-        tags_to_write = format_tags_csv(post_tags) if post_tags else format_tags_csv(tag_line)
-        candidates.append((candidate_id, url, ext, tags_to_write))
 
-    if not candidates:
-        log(f"No candidates found for line (after dedupe): {tag_line}", quiet)
-        return 0, 0
-    log(f"Found {len(candidates)} candidates for line.", quiet)
+    # Pipeline: producer thread fetches metadata while consumer threads download.
+    job_queue: queue.Queue = queue.Queue(maxsize=max_workers * 2)
+    producer_done = threading.Event()
 
     reserved: set = set()
-    jobs: List[Tuple[str, str, Path, Path, str]] = []
-    for candidate_id, url, ext, post_tags in candidates:
-        name = reserve_basename(output_dir, name_length, reserved, global_reserved_names, name_lock)
-        image_path = output_dir / f"{name}{ext}"
-        tags_path = output_dir / f"{name}.txt"
-        jobs.append((candidate_id, url, image_path, tags_path, post_tags))
+
+    def _producer():
+        try:
+            for post in iter_candidate_posts(tags_query, cfg, max_posts):
+                if STOP_EVENT.is_set():
+                    break
+                url = pick_post_url(post, use_sample)
+                if not url:
+                    continue
+                candidate_id = str(post.get("id") or url)
+                if ids_lock:
+                    with ids_lock:
+                        if candidate_id in downloaded_ids:
+                            continue
+                elif candidate_id in downloaded_ids:
+                    continue
+                ext = infer_extension(url)
+                if allowed_exts and ext.lower() not in allowed_exts:
+                    continue
+                post_tags = (post.get("tags") or "").strip()
+                tags_to_write = format_tags_csv(post_tags) if post_tags else format_tags_csv(tag_line)
+                name = reserve_basename(output_dir, name_length, reserved, global_reserved_names, name_lock)
+                image_path = output_dir / f"{name}{ext}"
+                tags_path = output_dir / f"{name}.txt"
+                job_queue.put((candidate_id, url, image_path, tags_path, tags_to_write))
+        finally:
+            producer_done.set()
+
+    producer_thread = threading.Thread(target=_producer, daemon=True)
+    producer_thread.start()
 
     success = 0
     attempted = 0
-    job_iter = iter(jobs)
     pending = {}
     executor = ThreadPoolExecutor(max_workers=max_workers)
     try:
         while success < remaining and not STOP_EVENT.is_set():
+            # Fill pending slots from queue.
             while len(pending) < max_workers and (success + len(pending)) < remaining and not STOP_EVENT.is_set():
                 try:
-                    candidate_id, url, image_path, tags_path, post_tags = next(job_iter)
-                except StopIteration:
-                    break
+                    item = job_queue.get(timeout=0.05)
+                except queue.Empty:
+                    if producer_done.is_set() and job_queue.empty():
+                        break
+                    continue
+                candidate_id, url, image_path, tags_path, post_tags = item
                 if ids_lock:
                     with ids_lock:
                         if candidate_id in downloaded_ids or candidate_id in inflight_ids:
@@ -665,8 +691,10 @@ def download_for_line(
                 pending[future] = (candidate_id, url, image_path)
                 attempted += 1
             if not pending:
-                break
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                if producer_done.is_set() and job_queue.empty():
+                    break
+                continue
+            done, _ = wait(pending, return_when=FIRST_COMPLETED, timeout=0.5)
             for future in done:
                 try:
                     ok, size, elapsed, err = future.result()
@@ -706,6 +734,7 @@ def download_for_line(
         STOP_EVENT.set()
         log("Interrupted while downloading line; canceling pending jobs...", quiet)
     finally:
+        producer_thread.join(timeout=2)
         executor.shutdown(wait=not STOP_EVENT.is_set(), cancel_futures=True)
 
     return success, attempted
@@ -728,7 +757,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default="downloads", help="Directory to store media and tag files")
     parser.add_argument("--per-line", type=int, default=1, help="Media files to download per line")
     parser.add_argument("--candidate-factor", type=int, default=25, help="How many candidates to scan per target")
-    parser.add_argument("--limit", type=int, default=200, help="API limit per page (max 1000)")
+    parser.add_argument("--limit", type=int, default=1000, help="API limit per page (max 1000)")
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--sort", default="sort:score:desc", help="Sort meta tag (default: sort:score:desc)")
@@ -748,7 +777,7 @@ def main() -> int:
     parser.add_argument(
         "--chunk-mb",
         type=float,
-        default=4.0,
+        default=8.0,
         help="Read chunk size per download stream in MB",
     )
     parser.add_argument("--use-sample", action="store_true", help="Prefer sample_url instead of file_url")
