@@ -36,7 +36,9 @@ def _handle_sigint(_signum, _frame):
         print("\nCtrl+C: cancelling... (press again to force quit)", file=sys.stderr, flush=True)
     else:
         print("\nForce quit.", file=sys.stderr, flush=True)
-        os._exit(130)
+        # Restore default handler so terminal state is properly cleaned up
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
 
 
 def _init_signal_handler():
