@@ -157,14 +157,12 @@ class ProgressTracker:
 
     def _erase_status(self) -> None:
         """Move cursor up and clear all status lines."""
-        if self._status_lines > 0:
-            # Move up N lines and clear each
-            sys.stderr.write(f"\033[{self._status_lines}A")
-            for _ in range(self._status_lines):
-                sys.stderr.write("\033[2K\n")
-            sys.stderr.write(f"\033[{self._status_lines}A")
-            sys.stderr.flush()
-            self._status_lines = 0
+        if not self._is_tty or self._status_lines <= 0:
+            return
+        # Move to start of status block, clear each line.
+        sys.stderr.write(f"\r\033[{self._status_lines}A\033[J")
+        sys.stderr.flush()
+        self._status_lines = 0
 
     def _render(self, quiet: bool) -> None:
         if quiet:
@@ -173,20 +171,22 @@ class ProgressTracker:
         if elapsed <= 0:
             return
         if not self._is_tty:
-            # Non-TTY: print simple progress every 50 files.
             done = self.files_done
             if done % 50 == 0 or done == self.total_files:
                 total_mb = self.bytes_downloaded / (1024 * 1024)
                 log(f"  Progress: {done}/{self.total_files} files | {total_mb:.0f} MB", False)
             return
 
+        # Erase previous status block.
+        self._erase_status()
+
         lines_out = []
 
         # Per-line progress (active lines only).
-        active = {k: v for k, v in self._line_status.items()
-                  if v[0] < v[1] and k not in self._done_lines()}
-        for idx in sorted(active.keys()):
-            done_l, target_l, name = active[idx]
+        for idx in sorted(self._line_status.keys()):
+            done_l, target_l, name = self._line_status[idx]
+            if done_l >= target_l:
+                continue
             pct_l = (done_l / target_l * 100) if target_l > 0 else 0
             bar_len = 15
             filled = int(bar_len * done_l / target_l) if target_l > 0 else 0
@@ -213,19 +213,10 @@ class ProgressTracker:
             f"| ETA {eta_str} | fail {self.files_failed}{retry_str}"
         )
 
-        # Write all status lines (each on its own cleared line).
-        parts = []
-        for i, ln in enumerate(lines_out):
-            if i == 0:
-                parts.append(f"\r\033[K{ln}")
-            else:
-                parts.append(f"\n\033[K{ln}")
-        sys.stderr.write("".join(parts))
+        # Write status block.
+        sys.stderr.write("\n".join(lines_out))
         sys.stderr.flush()
         self._status_lines = len(lines_out)
-
-    def _done_lines(self) -> set:
-        return {k for k, v in self._line_status.items() if v[0] >= v[1]}
 
 
 def load_creds(args: argparse.Namespace, quiet: bool) -> ApiCreds:
