@@ -130,11 +130,11 @@ def _resolve_videos(input_path: Path, min_duration: float, recursive: bool = Tru
         return _find_videos(input_path, min_duration=min_duration, recursive=recursive)
 
 
-def _detect_scenes_for_video(video_path: Path) -> tuple[Path, list[SceneBoundary]]:
+def _detect_scenes_for_video(video_path: Path, engine: str = "pyscenedetect") -> tuple[Path, list[SceneBoundary]]:
     """Detect and re-segment scenes for a single video. Runs in worker thread."""
     from .detector import detect_scenes, re_detect_long_scenes
 
-    scenes = detect_scenes(video_path, show_progress=False)
+    scenes = detect_scenes(video_path, engine=engine, show_progress=False)
     if scenes:
         scenes = re_detect_long_scenes(video_path, scenes, max_seconds=20.0)
     return video_path, scenes
@@ -258,7 +258,14 @@ def cli():
     show_default=True,
     help="Skip videos already processed (tracked in processed_videos.log).",
 )
-def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool):
+@click.option(
+    "--engine", "-e",
+    type=click.Choice(["pyscenedetect", "transnetv2"], case_sensitive=False),
+    default="pyscenedetect",
+    show_default=True,
+    help="Scene detection engine: pyscenedetect (CPU) or transnetv2 (GPU).",
+)
+def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool, engine: str):
     """Extract frame pairs from video scenes.
 
     INPUT_PATH can be a directory, a single video file, or a .txt file with
@@ -299,7 +306,7 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     max_workers = min(max_workers, len(videos))
 
     pairs_info = f" (max {max_pairs}/video)" if max_pairs else ""
-    click.echo(f"Found {len(videos)} video(s). Mode: {mode}. Workers: {max_workers}{pairs_info}")
+    click.echo(f"Found {len(videos)} video(s). Mode: {mode}. Engine: {engine}. Workers: {max_workers}{pairs_info}")
 
     # Scan for existing pair files to avoid label collision on re-runs
     def _find_max_label(directory: Path) -> int:
@@ -352,13 +359,13 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     cancelled = False
 
     if len(videos) == 1:
-        video_path, scenes = _detect_scenes_for_video(videos[0])
+        video_path, scenes = _detect_scenes_for_video(videos[0], engine=engine)
         pending_results[video_path] = scenes
         _flush_ready()
     else:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {
-            executor.submit(_detect_scenes_for_video, v): v
+            executor.submit(_detect_scenes_for_video, v, engine): v
             for v in videos
         }
         pbar = tqdm(total=len(futures), desc="Processing")

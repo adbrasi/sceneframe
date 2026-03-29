@@ -8,11 +8,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+ENGINES = ("pyscenedetect", "transnetv2")
+
 # Singleton TransNetV2 model — loaded once, reused across all videos
 _transnet_model = None
-_transnet_available: bool | None = None  # None = not checked yet
 _transnet_lock = threading.Lock()
-_inference_lock = threading.Lock()  # GPU inference is not thread-safe
+_inference_lock = threading.Lock()
 
 
 @dataclass
@@ -26,125 +27,14 @@ class SceneBoundary:
         return (self.end_frame - self.start_frame) / self.fps
 
 
-def _get_video_info(video_path: Path) -> tuple[float, int]:
-    """Get fps and total frame count from a video."""
-    cap = cv2.VideoCapture(str(video_path))
-    try:
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        return fps, total
-    finally:
-        cap.release()
+# ---------------------------------------------------------------------------
+# PySceneDetect engine (CPU)
+# ---------------------------------------------------------------------------
 
-
-def _get_transnet_model():
-    """Get or create the singleton TransNetV2 model (thread-safe)."""
-    global _transnet_model, _transnet_available
-
-    # Fast path — no lock needed if already resolved
-    if _transnet_available is False:
-        return None
-    if _transnet_model is not None:
-        return _transnet_model
-
-    with _transnet_lock:
-        # Double-check after acquiring lock
-        if _transnet_available is False:
-            return None
-        if _transnet_model is not None:
-            return _transnet_model
-
-        try:
-            from transnetv2_pytorch import TransNetV2
-            _transnet_model = TransNetV2(device="auto")
-            _transnet_available = True
-
-            device = getattr(_transnet_model, "device", "unknown")
-            logger.info("TransNetV2 loaded on device: %s", device)
-            return _transnet_model
-        except ImportError:
-            _transnet_available = False
-            logger.info("TransNetV2 not installed — using PySceneDetect (CPU)")
-            return None
-        except Exception as e:
-            _transnet_available = False
-            logger.warning("TransNetV2 failed to load: %s — using PySceneDetect (CPU)", e)
-            return None
-
-
-def _decode_frames_opencv(video_path: Path) -> tuple[np.ndarray, float, int]:
-    """Decode all frames from video using OpenCV, resized to 48x27 RGB.
-
-    Returns (frames_array, fps, total_frames).
-    frames_array shape: [N, 27, 48, 3] uint8 RGB.
-    """
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
-
-    try:
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # BGR -> RGB, resize to 48x27 (width x height)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            small = cv2.resize(rgb, (48, 27))
-            frames.append(small)
-
-        if not frames:
-            return np.empty((0, 27, 48, 3), dtype=np.uint8), fps, total
-
-        return np.array(frames, dtype=np.uint8), fps, len(frames)
-    finally:
-        cap.release()
-
-
-def _detect_scenes_transnet(video_path: Path, model) -> list[SceneBoundary]:
-    """Detect scenes using TransNetV2 on GPU with OpenCV decoding (no ffmpeg).
-
-    Decodes frames via OpenCV (thread-safe per video), then runs GPU inference
-    with a lock to prevent concurrent CUDA writes.
-    """
-    import torch
-
-    # Decode on CPU (thread-safe, each thread has its own VideoCapture)
-    frames, fps, total_frames = _decode_frames_opencv(video_path)
-    if len(frames) == 0 or fps <= 0:
-        return []
-
-    # GPU inference needs a lock (CUDA not thread-safe for writes)
-    frames_tensor = torch.from_numpy(frames)
-    with _inference_lock:
-        frames_tensor = frames_tensor.to(model.device)
-        with torch.no_grad():
-            single_pred, _ = model.predict_frames(frames_tensor)
-
-    # Convert predictions to scene boundaries
-    scenes_array = model.predictions_to_scenes(single_pred.cpu().numpy())
-
-    if len(scenes_array) == 0:
-        return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
-
-    boundaries = []
-    for start, end in scenes_array:
-        boundaries.append(SceneBoundary(
-            start_frame=int(start),
-            end_frame=int(end),
-            fps=fps,
-        ))
-    return boundaries
-
-
-def _detect_scenes_pyscenedetect(video_path: Path, show_progress: bool) -> list[SceneBoundary]:
-    """Detect scenes using PySceneDetect ContentDetector (CPU fallback)."""
+def _detect_pyscenedetect(video_path: Path, show_progress: bool) -> list[SceneBoundary]:
+    """Detect scenes using PySceneDetect ContentDetector (CPU)."""
     from scenedetect import detect, ContentDetector, open_video as sv_open_video
 
-    logger.info("Detecting scenes (CPU)...")
     scene_list = detect(str(video_path), ContentDetector(), show_progress=show_progress)
 
     video = sv_open_video(str(video_path))
@@ -169,10 +59,107 @@ def _detect_scenes_pyscenedetect(video_path: Path, show_progress: bool) -> list[
     return boundaries
 
 
-def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBoundary]:
+# ---------------------------------------------------------------------------
+# TransNetV2 engine (GPU)
+# ---------------------------------------------------------------------------
+
+def _get_transnet_model():
+    """Get or create the singleton TransNetV2 model (thread-safe)."""
+    global _transnet_model
+
+    if _transnet_model is not None:
+        return _transnet_model
+
+    with _transnet_lock:
+        if _transnet_model is not None:
+            return _transnet_model
+
+        from transnetv2_pytorch import TransNetV2
+        _transnet_model = TransNetV2(device="auto")
+        device = getattr(_transnet_model, "device", "unknown")
+        logger.info("TransNetV2 loaded on device: %s", device)
+        return _transnet_model
+
+
+def _decode_frames_opencv(video_path: Path) -> tuple[np.ndarray, float, int]:
+    """Decode all frames from video using OpenCV, resized to 48x27 RGB.
+
+    Returns (frames_array, fps, total_frames).
+    frames_array shape: [N, 27, 48, 3] uint8 RGB.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            small = cv2.resize(rgb, (48, 27))
+            frames.append(small)
+
+        if not frames:
+            return np.empty((0, 27, 48, 3), dtype=np.uint8), fps, 0
+
+        return np.array(frames, dtype=np.uint8), fps, len(frames)
+    finally:
+        cap.release()
+
+
+def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
+    """Detect scenes using TransNetV2 on GPU with OpenCV decoding."""
+    import torch
+
+    model = _get_transnet_model()
+
+    # Decode on CPU (thread-safe, each thread has its own VideoCapture)
+    frames, fps, total_frames = _decode_frames_opencv(video_path)
+    if total_frames == 0 or fps <= 0:
+        return []
+
+    # GPU inference with lock (CUDA not thread-safe for concurrent writes)
+    frames_tensor = torch.from_numpy(frames)
+    with _inference_lock:
+        frames_tensor = frames_tensor.to(model.device)
+        with torch.no_grad():
+            single_pred, _ = model.predict_frames(frames_tensor)
+
+    scenes_array = model.predictions_to_scenes(single_pred.cpu().numpy())
+
+    if len(scenes_array) == 0:
+        return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
+
+    boundaries = []
+    for start, end in scenes_array:
+        boundaries.append(SceneBoundary(
+            start_frame=int(start),
+            end_frame=int(end),
+            fps=fps,
+        ))
+    return boundaries
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def detect_scenes(
+    video_path: Path,
+    engine: str = "pyscenedetect",
+    show_progress: bool = True,
+) -> list[SceneBoundary]:
     """Detect scene boundaries in a video.
 
-    Uses TransNetV2 (GPU) if available, falls back to PySceneDetect (CPU).
+    Parameters
+    ----------
+    engine : str
+        "pyscenedetect" (CPU, default) or "transnetv2" (GPU).
+
     Returns a list of SceneBoundary. Returns empty list on failure.
     """
     video_path = Path(video_path)
@@ -180,17 +167,13 @@ def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBou
         logger.warning("Video not found: %s", video_path)
         return []
 
-    model = _get_transnet_model()
-    if model is not None:
-        try:
-            return _detect_scenes_transnet(video_path, model)
-        except Exception as e:
-            logger.warning("[TransNetV2] %s failed: %s — fallback to CPU", video_path.name, e)
-
     try:
-        return _detect_scenes_pyscenedetect(video_path, show_progress)
+        if engine == "transnetv2":
+            return _detect_transnetv2(video_path)
+        else:
+            return _detect_pyscenedetect(video_path, show_progress)
     except Exception as e:
-        logger.error("Scene detection failed for %s: %s", video_path, e)
+        logger.error("[%s] Scene detection failed for %s: %s", engine, video_path.name, e)
         return []
 
 
