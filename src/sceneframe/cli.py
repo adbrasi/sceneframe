@@ -130,14 +130,18 @@ def _resolve_videos(input_path: Path, min_duration: float, recursive: bool = Tru
         return _find_videos(input_path, min_duration=min_duration, recursive=recursive)
 
 
-def _detect_scenes_for_video(video_path: Path, engine: str = "pyscenedetect") -> tuple[Path, list[SceneBoundary]]:
+def _detect_scenes_for_video(
+    video_path: Path,
+    engine: str = "pyscenedetect",
+    redetect: bool = True,
+) -> tuple[Path, list[SceneBoundary]]:
     """Detect and re-segment scenes for a single video. Runs in worker thread."""
     from .detector import detect_scenes, re_detect_long_scenes
 
     scenes = detect_scenes(video_path, engine=engine, show_progress=False)
     # TransNetV2 already detects dissolves/gradual transitions — re_detect is
     # redundant and expensive (reopens video + runs PySceneDetect CPU per scene).
-    if scenes and engine != "transnetv2":
+    if scenes and redetect and engine != "transnetv2":
         scenes = re_detect_long_scenes(video_path, scenes, max_seconds=20.0)
     return video_path, scenes
 
@@ -267,7 +271,13 @@ def cli():
     show_default=True,
     help="Scene detection engine: pyscenedetect (CPU) or transnetv2 (GPU).",
 )
-def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool, engine: str):
+@click.option(
+    "--redetect/--no-redetect",
+    default=True,
+    show_default=True,
+    help="Re-segment long scenes (>20s) with AdaptiveDetector. Only applies to pyscenedetect.",
+)
+def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool, engine: str, redetect: bool):
     """Extract frame pairs from video scenes.
 
     INPUT_PATH can be a directory, a single video file, or a .txt file with
@@ -365,13 +375,13 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     cancelled = False
 
     if len(videos) == 1:
-        video_path, scenes = _detect_scenes_for_video(videos[0], engine=engine)
+        video_path, scenes = _detect_scenes_for_video(videos[0], engine=engine, redetect=redetect)
         pending_results[video_path] = scenes
         _flush_ready()
     else:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {
-            executor.submit(_detect_scenes_for_video, v, engine): v
+            executor.submit(_detect_scenes_for_video, v, engine, redetect): v
             for v in videos
         }
         pbar = tqdm(total=len(futures), desc="Processing")
