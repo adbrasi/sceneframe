@@ -206,8 +206,12 @@ def generate_depth_maps(
         images = [Image.open(p).convert("RGB") for p in batch_paths]
         original_sizes = [img.size for img in images]  # (W, H)
 
-        # Preprocess entire batch — force uniform size so tensors can be stacked
-        inputs = processor(images=images, return_tensors="pt", do_resize=True, size={"height": 518, "width": 518})
+        # Resize all images to uniform dimensions so batch can be stacked
+        # (processor's do_resize keeps aspect ratio, causing size mismatch)
+        DEPTH_SIZE = (518, 518)
+        images_resized = [img.resize(DEPTH_SIZE, Image.BILINEAR) for img in images]
+
+        inputs = processor(images=images_resized, return_tensors="pt")
         inputs = {k: v.to(device, dtype=dtype) if v.is_floating_point() else v.to(device) for k, v in inputs.items()}
 
         with torch.no_grad():
