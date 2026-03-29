@@ -18,13 +18,17 @@ class VideoDecodeError(Exception):
 # Default workers per engine (tuned for EPYC 48-96 core + RTX 5090/PRO 6000)
 DEFAULT_WORKERS = {
     "pyscenedetect": None,  # cpu_count - 2 (set at runtime)
-    "transnetv2": 8,        # 6-8 optimal: ffmpeg decode is I/O bound, GPU inference is fast
+    "transnetv2": 16,       # ffmpeg decode is I/O bound; more workers keep GPU fed
 }
+
+# How many concurrent GPU inferences to allow (pipeline: while one runs,
+# another thread can prepare/enqueue its work on the CUDA stream)
+GPU_CONCURRENCY = 4
 
 # Singleton TransNetV2 model — loaded once, reused across all videos
 _transnet_model = None
 _transnet_lock = threading.Lock()
-_inference_lock = threading.Lock()
+_inference_semaphore = threading.Semaphore(GPU_CONCURRENCY)
 
 
 @dataclass
@@ -174,8 +178,9 @@ def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
     import torch
     frames_tensor = torch.from_numpy(frames.copy()).to(model.device)
 
-    # GPU inference with lock (CUDA not thread-safe for concurrent kernels)
-    with _inference_lock:
+    # GPU inference with semaphore (allows GPU_CONCURRENCY concurrent inferences
+    # so threads can pipeline: one runs on GPU while others prepare/enqueue)
+    with _inference_semaphore:
         with torch.no_grad():
             single_pred, _ = model.predict_frames(frames_tensor)
 
