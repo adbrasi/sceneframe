@@ -168,7 +168,7 @@ def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
 
     # Convert numpy to tensor on the model device (predict_frames expects Tensor)
     import torch
-    frames_tensor = torch.from_numpy(frames).to(model.device)
+    frames_tensor = torch.from_numpy(frames.copy()).to(model.device)
 
     # GPU inference with lock (CUDA not thread-safe for concurrent kernels)
     with _inference_lock:
