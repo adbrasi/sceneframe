@@ -48,16 +48,15 @@ def _select_subset(
     return sorted(random.sample(candidates, count))
 
 
-def generate_image_base(candidates: list[Path]) -> int:
-    """Copy _A images as _image_base.jpg for selected _B candidates.
-
-    For each _B.jpg in candidates, finds the corresponding _A.jpg
-    and copies it as NNNNNN_image_base.jpg.
+def generate_image_base(candidates: list[Path], source: str = "A") -> int:
+    """Copy source image (A or B) as _image_base.jpg for selected _B candidates.
 
     Parameters
     ----------
     candidates : list[Path]
-        List of _B.jpg files whose corresponding _A should be copied.
+        List of _B.jpg files to process.
+    source : str
+        Which image to copy: "A" or "B".
 
     Returns
     -------
@@ -69,16 +68,20 @@ def generate_image_base(candidates: list[Path]) -> int:
     if not candidates:
         return 0
 
-    logger.info("Generating image_base for %d images", len(candidates))
+    source = source.upper()
+    if source not in ("A", "B"):
+        raise ValueError(f"source must be 'A' or 'B', got '{source}'")
+
+    logger.info("Generating image_base from _%s for %d images", source, len(candidates))
     saved = 0
 
     for b_path in tqdm(candidates, desc="Image base"):
-        a_path = b_path.parent / b_path.name.replace("_B.jpg", "_A.jpg")
-        if not a_path.exists():
-            logger.warning("Missing _A for %s, skipping", b_path.name)
+        src_path = b_path.parent / b_path.name.replace("_B.jpg", f"_{source}.jpg")
+        if not src_path.exists():
+            logger.warning("Missing _%s for %s, skipping", source, b_path.name)
             continue
         dest = b_path.parent / b_path.name.replace("_B.jpg", "_image_base.jpg")
-        shutil.copy2(str(a_path), str(dest))
+        shutil.copy2(str(src_path), str(dest))
         saved += 1
 
     return saved

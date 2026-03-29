@@ -424,7 +424,8 @@ def clean(
 @click.option("--percentage", "-p", type=float, default=100.0, show_default=True, help="Total % of _B images that receive a control image (0-100).")
 @click.option("--depth", type=float, default=100.0, show_default=True, help="% of selected images that get depth maps. Must sum to 100 with --canny and --image-base.")
 @click.option("--canny", type=float, default=0.0, show_default=True, help="% of selected images that get canny edges. Must sum to 100 with --depth and --image-base.")
-@click.option("--image-base", type=float, default=0.0, show_default=True, help="% of selected images that get a copy of _A as _image_base.jpg. Must sum to 100 with --depth and --canny.")
+@click.option("--image-base", type=float, default=0.0, show_default=True, help="% of selected images that get a copy as _image_base.jpg. Must sum to 100 with --depth and --canny.")
+@click.option("--image-base-source", type=click.Choice(["A", "B"], case_sensitive=False), default="A", show_default=True, help="Which image to copy for image_base: A or B.")
 @click.option("--batch-size", "-b", type=int, default=8, show_default=True, help="Batch size for depth GPU inference.")
 @click.option("--device", type=str, default=None, help="Device for depth inference (cuda/cpu). Auto-detects if not set.")
 @click.option(
@@ -443,6 +444,7 @@ def control(
     depth: float,
     canny: float,
     image_base: float,
+    image_base_source: str,
     batch_size: int,
     device: str | None,
     model: str,
@@ -549,7 +551,7 @@ def control(
         )
 
     if base_candidates:
-        base_saved = generate_image_base(base_candidates)
+        base_saved = generate_image_base(base_candidates, source=image_base_source)
 
     total = depth_saved + canny_saved + base_saved
     click.echo(f"\nDone! Generated {depth_saved} depth + {canny_saved} canny + {base_saved} image_base = {total} control images -> {directory}")
