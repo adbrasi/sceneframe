@@ -6,6 +6,10 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
+# Singleton TransNetV2 model — loaded once, reused across all videos
+_transnet_model = None
+_transnet_available: bool | None = None  # None = not checked yet
+
 
 @dataclass
 class SceneBoundary:
@@ -29,15 +33,41 @@ def _get_video_info(video_path: Path) -> tuple[float, int]:
         cap.release()
 
 
-def _detect_scenes_transnet(video_path: Path) -> list[SceneBoundary]:
-    """Detect scenes using TransNetV2 on GPU. Fast (~500+ fps on RTX 5090)."""
-    from transnetv2_pytorch import TransNetV2
+def _get_transnet_model():
+    """Get or create the singleton TransNetV2 model."""
+    global _transnet_model, _transnet_available
 
+    if _transnet_available is False:
+        return None
+
+    if _transnet_model is not None:
+        return _transnet_model
+
+    try:
+        from transnetv2_pytorch import TransNetV2
+        _transnet_model = TransNetV2(device="auto")
+        _transnet_available = True
+
+        # Log which device is being used
+        device = getattr(_transnet_model, "device", "unknown")
+        logger.info("TransNetV2 loaded on device: %s", device)
+        return _transnet_model
+    except ImportError:
+        _transnet_available = False
+        logger.info("TransNetV2 not installed — using PySceneDetect (CPU)")
+        return None
+    except Exception as e:
+        _transnet_available = False
+        logger.warning("TransNetV2 failed to load: %s — using PySceneDetect (CPU)", e)
+        return None
+
+
+def _detect_scenes_transnet(video_path: Path, model) -> list[SceneBoundary]:
+    """Detect scenes using TransNetV2 on GPU. Fast (~500+ fps on RTX 5090)."""
     fps, total_frames = _get_video_info(video_path)
     if total_frames <= 0 or fps <= 0:
         return []
 
-    model = TransNetV2(device="auto")
     scenes = model.detect_scenes(str(video_path))
 
     if not scenes:
@@ -57,6 +87,7 @@ def _detect_scenes_pyscenedetect(video_path: Path, show_progress: bool) -> list[
     """Detect scenes using PySceneDetect ContentDetector (CPU fallback)."""
     from scenedetect import detect, ContentDetector, open_video as sv_open_video
 
+    logger.info("Detecting scenes (CPU)...")
     scene_list = detect(str(video_path), ContentDetector(), show_progress=show_progress)
 
     video = sv_open_video(str(video_path))
@@ -92,12 +123,12 @@ def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBou
         logger.warning("Video not found: %s", video_path)
         return []
 
-    try:
-        return _detect_scenes_transnet(video_path)
-    except ImportError:
-        logger.debug("TransNetV2 not available, using PySceneDetect (CPU)")
-    except Exception as e:
-        logger.warning("TransNetV2 failed for %s: %s — falling back to PySceneDetect", video_path.name, e)
+    model = _get_transnet_model()
+    if model is not None:
+        try:
+            return _detect_scenes_transnet(video_path, model)
+        except Exception as e:
+            logger.warning("[TransNetV2] %s failed: %s — fallback to CPU", video_path.name, e)
 
     try:
         return _detect_scenes_pyscenedetect(video_path, show_progress)
