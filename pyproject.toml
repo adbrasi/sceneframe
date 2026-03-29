@@ -20,6 +20,7 @@ gpu = [
     "torch>=2.0",
     "transformers>=4.40",
     "Pillow>=10.0",
+    "transnetv2-pytorch>=1.0",
 ]
 
 [project.scripts]

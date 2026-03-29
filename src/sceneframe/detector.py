@@ -1,7 +1,8 @@
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
+
+import cv2
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,69 @@ class SceneBoundary:
         return (self.end_frame - self.start_frame) / self.fps
 
 
-def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBoundary]:
-    """Detect scene boundaries in a video using PySceneDetect ContentDetector.
+def _get_video_info(video_path: Path) -> tuple[float, int]:
+    """Get fps and total frame count from a video."""
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        return fps, total
+    finally:
+        cap.release()
 
+
+def _detect_scenes_transnet(video_path: Path) -> list[SceneBoundary]:
+    """Detect scenes using TransNetV2 on GPU. Fast (~500+ fps on RTX 5090)."""
+    from transnetv2_pytorch import TransNetV2
+
+    fps, total_frames = _get_video_info(video_path)
+    if total_frames <= 0 or fps <= 0:
+        return []
+
+    model = TransNetV2()
+    scenes = model.detect_scenes(str(video_path))
+
+    if not scenes:
+        return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
+
+    boundaries = []
+    for start, end in scenes:
+        boundaries.append(SceneBoundary(start_frame=start, end_frame=end, fps=fps))
+    return boundaries
+
+
+def _detect_scenes_pyscenedetect(video_path: Path, show_progress: bool) -> list[SceneBoundary]:
+    """Detect scenes using PySceneDetect ContentDetector (CPU fallback)."""
+    from scenedetect import detect, ContentDetector, open_video as sv_open_video
+
+    scene_list = detect(str(video_path), ContentDetector(), show_progress=show_progress)
+
+    video = sv_open_video(str(video_path))
+    fps = video.frame_rate
+    total_frames = video.duration.frame_num
+    del video
+
+    if not scene_list:
+        if total_frames > 0:
+            return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
+        return []
+
+    boundaries = []
+    for start_tc, end_tc in scene_list:
+        boundaries.append(
+            SceneBoundary(
+                start_frame=start_tc.frame_num,
+                end_frame=end_tc.frame_num,
+                fps=fps,
+            )
+        )
+    return boundaries
+
+
+def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBoundary]:
+    """Detect scene boundaries in a video.
+
+    Uses TransNetV2 (GPU) if available, falls back to PySceneDetect (CPU).
     Returns a list of SceneBoundary. Returns empty list on failure.
     """
     video_path = Path(video_path)
@@ -28,35 +89,14 @@ def detect_scenes(video_path: Path, show_progress: bool = True) -> list[SceneBou
         return []
 
     try:
-        from scenedetect import detect, ContentDetector
+        return _detect_scenes_transnet(video_path)
+    except ImportError:
+        logger.debug("TransNetV2 not available, using PySceneDetect (CPU)")
+    except Exception as e:
+        logger.warning("TransNetV2 failed for %s: %s — falling back to PySceneDetect", video_path.name, e)
 
-        from scenedetect import open_video as sv_open_video
-
-        scene_list = detect(str(video_path), ContentDetector(), show_progress=show_progress)
-
-        # Get video info for fallback
-        video = sv_open_video(str(video_path))
-        fps = video.frame_rate
-        total_frames = video.duration.frame_num
-        del video
-
-        if not scene_list:
-            # No cuts detected — treat entire video as one scene
-            if total_frames > 0:
-                return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
-            return []
-
-        boundaries = []
-        for start_tc, end_tc in scene_list:
-            boundaries.append(
-                SceneBoundary(
-                    start_frame=start_tc.frame_num,
-                    end_frame=end_tc.frame_num,
-                    fps=fps,
-                )
-            )
-        return boundaries
-
+    try:
+        return _detect_scenes_pyscenedetect(video_path, show_progress)
     except Exception as e:
         logger.error("Scene detection failed for %s: %s", video_path, e)
         return []
