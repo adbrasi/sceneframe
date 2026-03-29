@@ -1,4 +1,5 @@
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,7 @@ logger = logging.getLogger(__name__)
 # Singleton TransNetV2 model — loaded once, reused across all videos
 _transnet_model = None
 _transnet_available: bool | None = None  # None = not checked yet
+_transnet_lock = threading.Lock()
 
 
 @dataclass
@@ -34,32 +36,38 @@ def _get_video_info(video_path: Path) -> tuple[float, int]:
 
 
 def _get_transnet_model():
-    """Get or create the singleton TransNetV2 model."""
+    """Get or create the singleton TransNetV2 model (thread-safe)."""
     global _transnet_model, _transnet_available
 
+    # Fast path — no lock needed if already resolved
     if _transnet_available is False:
         return None
-
     if _transnet_model is not None:
         return _transnet_model
 
-    try:
-        from transnetv2_pytorch import TransNetV2
-        _transnet_model = TransNetV2(device="auto")
-        _transnet_available = True
+    with _transnet_lock:
+        # Double-check after acquiring lock
+        if _transnet_available is False:
+            return None
+        if _transnet_model is not None:
+            return _transnet_model
 
-        # Log which device is being used
-        device = getattr(_transnet_model, "device", "unknown")
-        logger.info("TransNetV2 loaded on device: %s", device)
-        return _transnet_model
-    except ImportError:
-        _transnet_available = False
-        logger.info("TransNetV2 not installed — using PySceneDetect (CPU)")
-        return None
-    except Exception as e:
-        _transnet_available = False
-        logger.warning("TransNetV2 failed to load: %s — using PySceneDetect (CPU)", e)
-        return None
+        try:
+            from transnetv2_pytorch import TransNetV2
+            _transnet_model = TransNetV2(device="auto")
+            _transnet_available = True
+
+            device = getattr(_transnet_model, "device", "unknown")
+            logger.info("TransNetV2 loaded on device: %s", device)
+            return _transnet_model
+        except ImportError:
+            _transnet_available = False
+            logger.info("TransNetV2 not installed — using PySceneDetect (CPU)")
+            return None
+        except Exception as e:
+            _transnet_available = False
+            logger.warning("TransNetV2 failed to load: %s — using PySceneDetect (CPU)", e)
+            return None
 
 
 def _detect_scenes_transnet(video_path: Path, model) -> list[SceneBoundary]:
