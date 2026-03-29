@@ -377,11 +377,11 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     help="Keep NSFW images (reverse filter) or remove them.",
 )
 @click.option("--nsfw-confidence", type=float, default=0.5, show_default=True, help="NSFW classification confidence threshold.")
-@click.option("--nsfw-batch-size", type=int, default=32, show_default=True, help="Batch size for NSFW inference.")
+@click.option("--nsfw-batch-size", type=int, default=64, show_default=True, help="Batch size for NSFW inference.")
 @click.option("--nsfw-device", type=str, default=None, help="Device for NSFW model (cuda/cpu). Auto-detects if not set.")
 @click.option("--similarity", type=float, default=0.96, show_default=True, help="Min cosine similarity for duplicate detection (0-1). Higher = stricter.")
 @click.option("--solid-threshold", type=float, default=12.0, show_default=True, help="Max std-dev per channel to consider solid color.")
-@click.option("--workers", "-w", type=int, default=8, show_default=True, help="Parallel workers for image processing.")
+@click.option("--workers", "-w", type=int, default=16, show_default=True, help="Parallel workers for image processing.")
 @click.option("--dry-run", is_flag=True, help="Show what would be removed without deleting.")
 def clean(
     directory: Path,
@@ -450,7 +450,7 @@ def clean(
 @click.option("--canny", type=float, default=0.0, show_default=True, help="% of selected images that get canny edges. Must sum to 100 with --depth and --image-base.")
 @click.option("--image-base", type=float, default=0.0, show_default=True, help="% of selected images that get a copy as _image_base.jpg. Must sum to 100 with --depth and --canny.")
 @click.option("--image-base-source", type=click.Choice(["A", "B"], case_sensitive=False), default="A", show_default=True, help="Which image to copy for image_base: A or B.")
-@click.option("--batch-size", "-b", type=int, default=8, show_default=True, help="Batch size for depth GPU inference.")
+@click.option("--batch-size", "-b", type=int, default=32, show_default=True, help="Batch size for depth GPU inference. 32 for 32GB VRAM, 64+ for 96GB.")
 @click.option("--device", type=str, default=None, help="Device for depth inference (cuda/cpu). Auto-detects if not set.")
 @click.option(
     "--model", "-m",
@@ -461,6 +461,7 @@ def clean(
 )
 @click.option("--canny-low", type=int, default=100, show_default=True, help="Canny lower threshold.")
 @click.option("--canny-high", type=int, default=200, show_default=True, help="Canny upper threshold.")
+@click.option("--workers", "-w", type=int, default=16, show_default=True, help="Parallel workers for canny/image_base I/O.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducible subset selection.")
 def control(
     directory: Path,
@@ -474,6 +475,7 @@ def control(
     model: str,
     canny_low: int,
     canny_high: int,
+    workers: int,
     seed: int | None,
 ):
     """Generate control images from _B images using depth, canny, and/or image_base.
@@ -575,10 +577,13 @@ def control(
             canny_candidates,
             low_threshold=canny_low,
             high_threshold=canny_high,
+            workers=workers,
         )
 
     if base_candidates:
-        base_saved = generate_image_base(base_candidates, source=image_base_source)
+        base_saved = generate_image_base(
+            base_candidates, source=image_base_source, workers=workers,
+        )
 
     total = depth_saved + canny_saved + base_saved
     click.echo(f"\nDone! Generated {depth_saved} depth + {canny_saved} canny + {base_saved} image_base = {total} control images -> {directory}")

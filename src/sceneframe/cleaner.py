@@ -355,28 +355,32 @@ def retry_nsfw_pairs(
         batch_size=batch_size,
     )
 
-    # Step 1: Classify each A and B individually to find which ones triggered NSFW
-    flagged_suffixes: dict[str, set[str]] = {}  # label -> {"A"} or {"B"} or {"A", "B"}
+    # Step 1: Batch-classify A and B to find which frames triggered NSFW
+    step1_labels: list[str] = []
+    step1_suffixes: list[str] = []
+    step1_paths: list[Path] = []
     for label in sorted(retryable):
-        flagged: set[str] = set()
         for suffix in ("A", "B"):
             path = directory / f"{label}_{suffix}.jpg"
-            if not path.exists():
-                continue
-            img = Image.open(path).convert("RGB")
-            results = classifier([img])
-            top = max(results[0], key=lambda x: x["score"])
+            if path.exists():
+                step1_labels.append(label)
+                step1_suffixes.append(suffix)
+                step1_paths.append(path)
+
+    flagged_suffixes: dict[str, set[str]] = {}
+    for i in tqdm(range(0, len(step1_paths), batch_size), desc="NSFW retry: identifying"):
+        batch_paths = step1_paths[i : i + batch_size]
+        batch_labels = step1_labels[i : i + batch_size]
+        batch_suffixes = step1_suffixes[i : i + batch_size]
+        images = [Image.open(p).convert("RGB") for p in batch_paths]
+
+        results = classifier(images)
+        for lbl, suffix, result in zip(batch_labels, batch_suffixes, results):
+            top = max(result, key=lambda x: x["score"])
             is_nsfw = top["label"] == "nsfw" and top["score"] >= confidence
-            if keep_nsfw:
-                # In keep_nsfw mode, we want NSFW content — flag frames that are SFW
-                if not is_nsfw:
-                    flagged.add(suffix)
-            else:
-                # In remove_nsfw mode, flag frames that are NSFW
-                if is_nsfw:
-                    flagged.add(suffix)
-        if flagged:
-            flagged_suffixes[label] = flagged
+            should_flag = (not is_nsfw) if keep_nsfw else is_nsfw
+            if should_flag:
+                flagged_suffixes.setdefault(lbl, set()).add(suffix)
 
     # Group by video to open each one only once
     by_video: dict[str, list[str]] = {}

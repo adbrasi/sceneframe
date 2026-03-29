@@ -2,12 +2,14 @@
 
 Supports:
 - Depth maps via Depth Anything V2 (GPU, batched FP16 inference)
-- Canny edge detection via OpenCV (CPU, very fast)
+- Canny edge detection via OpenCV (CPU, multi-threaded)
+- Image base copy (parallel file copy)
 
-Both are saved as _C.jpg alongside the source _B.jpg.
+Both depth and canny are saved as _C.jpg alongside the source _B.jpg.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -35,7 +37,9 @@ def _get_candidates(input_dir: Path) -> list[Path]:
     ]
 
 
-def generate_image_base(candidates: list[Path], source: str = "A") -> int:
+def generate_image_base(
+    candidates: list[Path], source: str = "A", workers: int = 16,
+) -> int:
     """Copy source image (A or B) as _image_base.jpg for selected _B candidates.
 
     Parameters
@@ -44,6 +48,8 @@ def generate_image_base(candidates: list[Path], source: str = "A") -> int:
         List of _B.jpg files to process.
     source : str
         Which image to copy: "A" or "B".
+    workers : int
+        Number of parallel copy threads.
 
     Returns
     -------
@@ -59,17 +65,22 @@ def generate_image_base(candidates: list[Path], source: str = "A") -> int:
     if source not in ("A", "B"):
         raise ValueError(f"source must be 'A' or 'B', got '{source}'")
 
-    logger.info("Generating image_base from _%s for %d images", source, len(candidates))
-    saved = 0
+    logger.info("Generating image_base from _%s for %d images (%d workers)",
+                source, len(candidates), workers)
 
-    for b_path in tqdm(candidates, desc="Image base"):
+    def _copy_one(b_path: Path) -> bool:
         src_path = b_path.parent / b_path.name.replace("_B.jpg", f"_{source}.jpg")
         if not src_path.exists():
-            logger.warning("Missing _%s for %s, skipping", source, b_path.name)
-            continue
+            return False
         dest = b_path.parent / b_path.name.replace("_B.jpg", "_image_base.jpg")
         shutil.copy2(str(src_path), str(dest))
-        saved += 1
+        return True
+
+    saved = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for ok in tqdm(pool.map(_copy_one, candidates), total=len(candidates), desc="Image base"):
+            if ok:
+                saved += 1
 
     return saved
 
@@ -78,10 +89,11 @@ def generate_canny_maps(
     candidates: list[Path],
     low_threshold: int = 100,
     high_threshold: int = 200,
+    workers: int = 16,
 ) -> int:
     """Generate Canny edge maps for _B images, saved as _C.jpg.
 
-    Pure OpenCV, no GPU required. Very fast.
+    Pure OpenCV, no GPU required. Multi-threaded for maximum I/O throughput.
 
     Parameters
     ----------
@@ -91,6 +103,8 @@ def generate_canny_maps(
         Canny lower threshold.
     high_threshold : int
         Canny upper threshold.
+    workers : int
+        Number of parallel processing threads.
 
     Returns
     -------
@@ -100,17 +114,23 @@ def generate_canny_maps(
     if not candidates:
         return 0
 
-    logger.info("Generating canny edge maps for %d images", len(candidates))
-    saved = 0
+    logger.info("Generating canny edge maps for %d images (%d workers)",
+                len(candidates), workers)
 
-    for path in tqdm(candidates, desc="Canny maps"):
+    def _process_one(path: Path) -> bool:
         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if img is None:
-            continue
+            return False
         edges = cv2.Canny(img, low_threshold, high_threshold)
         c_path = path.parent / path.name.replace("_B.jpg", "_C.jpg")
         cv2.imwrite(str(c_path), edges, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        saved += 1
+        return True
+
+    saved = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for ok in tqdm(pool.map(_process_one, candidates), total=len(candidates), desc="Canny maps"):
+            if ok:
+                saved += 1
 
     return saved
 
