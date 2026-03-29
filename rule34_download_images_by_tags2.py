@@ -99,7 +99,7 @@ def format_duration(seconds: float) -> str:
 
 
 class ProgressTracker:
-    """Thread-safe progress tracker with ETA calculation."""
+    """Thread-safe progress tracker with per-line and global status."""
 
     def __init__(self, total_files: int, total_lines: int):
         self._lock = threading.Lock()
@@ -110,62 +110,114 @@ class ProgressTracker:
         self.lines_done = 0
         self.bytes_downloaded = 0
         self.start_time = time.monotonic()
+        self.api_retries = 0
+        # Per-line tracking: {idx: (done, target, tag_short_name)}
+        self._line_status: dict = {}
+        self._status_lines = 0  # how many terminal lines our status block uses
 
-    def record_download(self, size_bytes: int, elapsed: float, quiet: bool) -> None:
+    def register_line(self, idx: int, target: int, tag_short: str) -> None:
+        with self._lock:
+            self._line_status[idx] = [0, target, tag_short]
+
+    def record_download(self, size_bytes: int, elapsed: float, line_idx: int, quiet: bool) -> None:
         with self._lock:
             self.files_done += 1
             self.bytes_downloaded += size_bytes
-            self._print_status(quiet)
+            if line_idx in self._line_status:
+                self._line_status[line_idx][0] += 1
+            self._render(quiet)
 
     def record_failure(self, err: str, quiet: bool) -> None:
         with self._lock:
             self.files_failed += 1
 
+    def record_api_retry(self) -> None:
+        with self._lock:
+            self.api_retries += 1
+
     def record_line_done(self, idx: int, line_total: int, per_line: int, quiet: bool) -> None:
         with self._lock:
             self.lines_done += 1
-            self._clear_line()
+            if idx in self._line_status:
+                self._line_status[idx][0] = line_total
+            self._erase_status()
             log(
                 f"  Line {idx} done: {line_total}/{per_line} files "
-                f"| Overall: {self.lines_done}/{self.total_lines} lines",
+                f"| Lines: {self.lines_done}/{self.total_lines}",
                 quiet,
             )
+            self._render(quiet)
 
     def log_message(self, msg: str, quiet: bool) -> None:
-        """Print a message that won't be overwritten by progress bar."""
         with self._lock:
-            self._clear_line()
+            self._erase_status()
             log(msg, quiet)
+            self._render(quiet)
 
-    @staticmethod
-    def _clear_line() -> None:
-        print("\r\033[K", end="", file=sys.stderr, flush=True)
+    def _erase_status(self) -> None:
+        """Move cursor up and clear all status lines."""
+        if self._status_lines > 0:
+            # Move up N lines and clear each
+            sys.stderr.write(f"\033[{self._status_lines}A")
+            for _ in range(self._status_lines):
+                sys.stderr.write("\033[2K\n")
+            sys.stderr.write(f"\033[{self._status_lines}A")
+            sys.stderr.flush()
+            self._status_lines = 0
 
-    def _print_status(self, quiet: bool) -> None:
+    def _render(self, quiet: bool) -> None:
         if quiet:
             return
         elapsed = time.monotonic() - self.start_time
         if elapsed <= 0:
             return
+
+        lines_out = []
+
+        # Per-line progress (active lines only).
+        active = {k: v for k, v in self._line_status.items()
+                  if v[0] < v[1] and k not in self._done_lines()}
+        for idx in sorted(active.keys()):
+            done_l, target_l, name = active[idx]
+            pct_l = (done_l / target_l * 100) if target_l > 0 else 0
+            bar_len = 15
+            filled = int(bar_len * done_l / target_l) if target_l > 0 else 0
+            bar = "█" * filled + "░" * (bar_len - filled)
+            lines_out.append(f"    L{idx} [{bar}] {done_l}/{target_l} ({pct_l:.0f}%) {name}")
+
+        # Global progress.
         done = self.files_done
         total = self.total_files
         pct = (done / total * 100) if total > 0 else 0
-        speed_mbps = (self.bytes_downloaded / (1024 * 1024)) / elapsed
+        speed = (self.bytes_downloaded / (1024 * 1024)) / elapsed
         if done > 0:
-            eta_sec = (elapsed / done) * (total - done)
-            eta_str = format_duration(eta_sec)
+            eta_str = format_duration((elapsed / done) * (total - done))
         else:
             eta_str = "..."
         total_mb = self.bytes_downloaded / (1024 * 1024)
         bar_len = 25
         filled = int(bar_len * done / total) if total > 0 else 0
         bar = "█" * filled + "░" * (bar_len - filled)
-        line = (
+        retry_str = f" | retries {self.api_retries}" if self.api_retries > 0 else ""
+        lines_out.append(
             f"  [{bar}] {done}/{total} ({pct:.0f}%) "
-            f"| {total_mb:.0f} MB | {speed_mbps:.1f} MB/s "
-            f"| ETA {eta_str} | fail {self.files_failed}"
+            f"| {total_mb:.0f} MB | {speed:.1f} MB/s "
+            f"| ETA {eta_str} | fail {self.files_failed}{retry_str}"
         )
-        print(f"\r\033[K{line}", end="", file=sys.stderr, flush=True)
+
+        # Write all status lines (each on its own cleared line).
+        parts = []
+        for i, ln in enumerate(lines_out):
+            if i == 0:
+                parts.append(f"\r\033[K{ln}")
+            else:
+                parts.append(f"\n\033[K{ln}")
+        sys.stderr.write("".join(parts))
+        sys.stderr.flush()
+        self._status_lines = len(lines_out)
+
+    def _done_lines(self) -> set:
+        return {k for k, v in self._line_status.items() if v[0] >= v[1]}
 
 
 def load_creds(args: argparse.Namespace, quiet: bool) -> ApiCreds:
@@ -712,6 +764,7 @@ def download_for_line(
     chunk_bytes: int,
     quiet: bool,
     progress: Optional["ProgressTracker"] = None,
+    line_idx: int = 0,
 ) -> Tuple[int, int]:
     if STOP_EVENT.is_set():
         return 0, 0
@@ -832,7 +885,7 @@ def download_for_line(
                             downloaded_ids.add(candidate_id)
                             append_id_cache(ids_cache_path, candidate_id)
                     if progress:
-                        progress.record_download(size, elapsed, quiet)
+                        progress.record_download(size, elapsed, line_idx, quiet)
                     else:
                         log(f"Saved {size / (1024 * 1024):.1f} MB in {elapsed:.1f}s", quiet)
                     if success >= remaining:
@@ -1052,11 +1105,22 @@ def main() -> int:
         line_output_dir.mkdir(parents=True, exist_ok=True)
         line_items.append((idx, tag_line, existing, line_output_dir))
 
+    def _short_tag(tag_line: str) -> str:
+        """Extract just the unique part of the tag line (strip global prefix)."""
+        if global_tags:
+            short = tag_line.replace(global_tags, "").strip()
+            if short:
+                return short[:40]
+        return tag_line[:40]
+
     def run_one_line(item: Tuple[int, str, int, Path]) -> Tuple[int, int, int, int]:
         idx, tag_line, existing, line_output_dir = item
         if STOP_EVENT.is_set():
             return idx, existing, 0, 0
-        progress.log_message(f"\n[{idx}/{len(lines)}] {tag_line}", args.quiet)
+        remaining = max(0, args.per_line - existing)
+        short = _short_tag(tag_line)
+        progress.register_line(idx, remaining, short)
+        progress.log_message(f"  Starting L{idx}: {short}", args.quiet)
         success, attempted = download_for_line(
             tag_line,
             cfg,
@@ -1082,6 +1146,7 @@ def main() -> int:
             chunk_bytes,
             args.quiet,
             progress,
+            line_idx=idx,
         )
         return idx, existing, success, attempted
 
