@@ -729,7 +729,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=200, help="API limit per page (max 1000)")
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=30.0)
-    parser.add_argument("--sort", default="", help="Sort meta tag, e.g. sort:score:desc")
+    parser.add_argument("--sort", default="sort:score:desc", help="Sort meta tag (default: sort:score:desc)")
     parser.add_argument("--name-length", type=int, default=10, help="Random base name length (<=10)")
     parser.add_argument(
         "--max-workers",
