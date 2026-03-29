@@ -252,7 +252,13 @@ def cli():
     show_default=True,
     help="Search for videos recursively in subdirectories.",
 )
-def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool):
+@click.option(
+    "--resume/--no-resume",
+    default=True,
+    show_default=True,
+    help="Skip videos already processed (tracked in processed_videos.log).",
+)
+def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool):
     """Extract frame pairs from video scenes.
 
     INPUT_PATH can be a directory, a single video file, or a .txt file with
@@ -273,6 +279,20 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     if not videos:
         click.echo("No video files found.", err=True)
         raise SystemExit(1)
+
+    # Resume: filter out already-processed videos
+    progress_log = output / "processed_videos.log"
+    processed_set: set[str] = set()
+    if resume and progress_log.exists():
+        processed_set = set(progress_log.read_text(encoding="utf-8").splitlines())
+        before = len(videos)
+        videos = [v for v in videos if str(v.resolve()) not in processed_set]
+        skipped = before - len(videos)
+        if skipped:
+            click.echo(f"Resume: skipping {skipped} already-processed videos.")
+        if not videos:
+            click.echo("All videos already processed. Use --no-resume to force reprocessing.")
+            raise SystemExit(0)
 
     cpu_count = os.cpu_count() or 4
     max_workers = workers if workers else max(1, cpu_count - 2)
@@ -321,6 +341,9 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
             total_pairs += pairs
             processed += 1
             next_video_idx += 1
+            # Log processed video for resume
+            with open(progress_log, "a", encoding="utf-8") as f:
+                f.write(str(video_path.resolve()) + "\n")
             if scenes:
                 click.echo(f"  [{processed}/{len(videos)}] {video_path.name}: {len(scenes)} scenes -> {pairs} pairs (total: {total_pairs})")
             else:
