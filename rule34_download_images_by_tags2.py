@@ -41,8 +41,8 @@ _API_POOL = urllib3.HTTPSPoolManager(
     headers={"User-Agent": "rule34-media-downloader/1.0"},
 )
 _CDN_POOL = urllib3.HTTPSPoolManager(
-    num_pools=16,
-    maxsize=512,
+    num_pools=8,
+    maxsize=128,
     retries=False,
     headers={"User-Agent": "rule34-image-downloader/1.0"},
 )
@@ -108,6 +108,7 @@ def http_get_raw(
 ) -> str:
     last_err: Optional[Exception] = None
     last_body: Optional[str] = None
+    resp = None
     for attempt in range(1, retries + 1):
         try:
             resp = _API_POOL.request("GET", url, timeout=timeout, preload_content=True)
@@ -126,8 +127,20 @@ def http_get_raw(
             last_err = exc
             if attempt >= retries:
                 break
-            sleep_for = backoff_base * (2 ** (attempt - 1))
-            sleep_for = min(sleep_for, max_backoff)
+            # Respect Retry-After header on rate limit (429) or server overload (503).
+            retry_after = None
+            if resp is not None and resp.status in (429, 503):
+                ra = resp.headers.get("Retry-After")
+                if ra:
+                    try:
+                        retry_after = float(ra)
+                    except ValueError:
+                        pass
+            if retry_after is not None:
+                sleep_for = min(retry_after, max_backoff)
+            else:
+                sleep_for = backoff_base * (2 ** (attempt - 1))
+                sleep_for = min(sleep_for, max_backoff)
             sleep_for += random.uniform(0, backoff_jitter)
             time.sleep(sleep_for)
     detail = f"Failed request after {retries} attempts: {last_err}"
@@ -205,6 +218,7 @@ def iter_posts_by_tags(tags: str, cfg: FetchConfig, deleted: bool = False) -> It
         if len(data) < limit:
             break
         page += 1
+        time.sleep(0.3)
 
 
 def load_tag_lines(path: Path) -> List[str]:
@@ -251,8 +265,8 @@ def resolve_download_workers(requested: int, quiet: bool) -> int:
     if requested > 0:
         return requested
     cpu = os.cpu_count() or 8
-    # Aggressive default for high-bandwidth instances while keeping an upper cap.
-    auto = min(256, max(24, cpu * 4))
+    # High but respectful default — enough to saturate fast links without abusing the CDN.
+    auto = min(64, max(16, cpu * 4))
     log(f"Auto max-workers: {auto} (cpu={cpu})", quiet)
     return auto
 
