@@ -328,6 +328,10 @@ def retry_nsfw_pairs(
             "Install with: pip install torch transformers Pillow"
         )
 
+    # Clean up stale _retry.jpg temp files from previous interrupted runs
+    for stale in directory.glob("*_retry.jpg"):
+        stale.unlink(missing_ok=True)
+
     metadata = _load_metadata(directory)
     if not metadata:
         logger.warning("No pairs_metadata.jsonl found — cannot retry NSFW pairs")

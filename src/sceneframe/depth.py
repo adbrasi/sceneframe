@@ -28,12 +28,15 @@ MODEL_PRESETS = {
 
 
 def _get_candidates(input_dir: Path) -> list[Path]:
-    """Find _B images without existing _C or _image_base control images."""
+    """Find _B images without existing _C control images.
+
+    Note: _image_base.jpg is independent of _C.jpg — having one does not
+    block generation of the other, so only _C.jpg is checked here.
+    """
     b_files = sorted(input_dir.glob("*_B.jpg"))
     return [
         f for f in b_files
         if not (f.parent / f.name.replace("_B.jpg", "_C.jpg")).exists()
-        and not (f.parent / f.name.replace("_B.jpg", "_image_base.jpg")).exists()
     ]
 
 
