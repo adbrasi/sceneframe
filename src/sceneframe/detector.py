@@ -166,9 +166,14 @@ def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
     if frames is None:
         return []
 
+    # Convert numpy to tensor on the model device (predict_frames expects Tensor)
+    import torch
+    frames_tensor = torch.from_numpy(frames).to(model.device)
+
     # GPU inference with lock (CUDA not thread-safe for concurrent kernels)
     with _inference_lock:
-        single_pred, _ = model.predict_frames(frames)
+        with torch.no_grad():
+            single_pred, _ = model.predict_frames(frames_tensor)
 
     # predictions_to_scenes expects numpy; predict_frames may return tensor
     if hasattr(single_pred, "cpu"):
