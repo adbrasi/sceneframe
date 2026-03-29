@@ -272,9 +272,9 @@ def cli():
     help="Scene detection engine: pyscenedetect (CPU) or transnetv2 (GPU).",
 )
 @click.option(
-    "--redetect/--no-redetect",
-    default=True,
-    show_default=True,
+    "--redetect",
+    is_flag=True,
+    default=False,
     help="Re-segment long scenes (>20s) with AdaptiveDetector. Only applies to pyscenedetect.",
 )
 def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool, engine: str, redetect: bool):
