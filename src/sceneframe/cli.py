@@ -13,7 +13,7 @@ import click
 import cv2
 from tqdm import tqdm
 
-from .detector import DEFAULT_WORKERS, SceneBoundary
+from .detector import DEFAULT_WORKERS, SceneBoundary, VideoDecodeError
 
 logger = logging.getLogger(__name__)
 
@@ -374,11 +374,30 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
             else:
                 click.echo(f"  [{processed}/{len(videos)}] {video_path.name}: no scenes")
 
+    import shutil
+
+    skipped_dir = output / "skipped"
+    skipped_count = 0
+
+    def _skip_video(v: Path):
+        nonlocal skipped_count
+        skipped_dir.mkdir(parents=True, exist_ok=True)
+        dest = skipped_dir / v.name
+        try:
+            shutil.move(str(v), str(dest))
+            skipped_count += 1
+        except OSError as e:
+            logger.warning("Could not move %s to skipped: %s", v.name, e)
+
     cancelled = False
 
     if len(videos) == 1:
-        video_path, scenes = _detect_scenes_for_video(videos[0], engine=engine, redetect=redetect)
-        pending_results[video_path] = scenes
+        try:
+            video_path, scenes = _detect_scenes_for_video(videos[0], engine=engine, redetect=redetect)
+            pending_results[video_path] = scenes
+        except VideoDecodeError:
+            _skip_video(videos[0])
+            pending_results[videos[0]] = []
         _flush_ready()
     else:
         executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -396,6 +415,11 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
                     video_path, scenes = future.result()
                     pending_results[video_path] = scenes
                     _flush_ready()
+                except VideoDecodeError:
+                    v = futures[future]
+                    _skip_video(v)
+                    pending_results[v] = []
+                    _flush_ready()
                 except Exception as e:
                     v = futures[future]
                     click.echo(f"  ERROR {v.name}: {e}", err=True)
@@ -410,10 +434,11 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
             executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
             _flush_ready()
 
+    skipped_msg = f" ({skipped_count} skipped → {skipped_dir})" if skipped_count else ""
     if cancelled:
-        click.echo(f"\nCancelled. Saved {total_pairs} pairs from {processed} videos so far -> {output}")
+        click.echo(f"\nCancelled. Saved {total_pairs} pairs from {processed} videos so far -> {output}{skipped_msg}")
     else:
-        click.echo(f"\nDone! {total_pairs} pairs from {len(videos)} videos -> {output}")
+        click.echo(f"\nDone! {total_pairs} pairs from {len(videos)} videos -> {output}{skipped_msg}")
 
 
 # ---------------------------------------------------------------------------

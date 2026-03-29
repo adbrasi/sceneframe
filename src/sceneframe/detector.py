@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 
 ENGINES = ("pyscenedetect", "transnetv2")
 
+
+class VideoDecodeError(Exception):
+    """Raised when a video cannot be decoded (corrupt file, unsupported codec, etc.)."""
+
 # Default workers per engine (tuned for EPYC 48-96 core + RTX 5090/PRO 6000)
 DEFAULT_WORKERS = {
     "pyscenedetect": None,  # cpu_count - 2 (set at runtime)
@@ -164,7 +168,7 @@ def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
     # Decode frames via ffmpeg subprocess (thread-safe, runs in parallel)
     frames = _decode_frames_ffmpeg(video_path)
     if frames is None:
-        return []
+        raise VideoDecodeError(f"Failed to decode: {video_path.name}")
 
     # Convert numpy to tensor on the model device (predict_frames expects Tensor)
     import torch
@@ -222,6 +226,8 @@ def detect_scenes(
             return _detect_transnetv2(video_path)
         else:
             return _detect_pyscenedetect(video_path, show_progress)
+    except VideoDecodeError:
+        raise
     except Exception as e:
         logger.error("[%s] Scene detection failed for %s: %s", engine, video_path.name, e)
         return []
