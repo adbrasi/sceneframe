@@ -136,14 +136,16 @@ class ProgressTracker:
         with self._lock:
             self.api_retries += 1
 
-    def record_line_done(self, idx: int, line_total: int, per_line: int, quiet: bool) -> None:
+    def record_line_done(self, idx: int, success: int, existing: int, per_line: int, quiet: bool) -> None:
         with self._lock:
             self.lines_done += 1
             if idx in self._line_status:
-                self._line_status[idx][0] = line_total
+                # Mark line as complete (set done = target).
+                self._line_status[idx][0] = self._line_status[idx][1]
+            total = existing + success
             self._erase_status()
             log(
-                f"  Line {idx} done: {line_total}/{per_line} files "
+                f"  Line {idx} done: +{success} new ({total}/{per_line} total) "
                 f"| Lines: {self.lines_done}/{self.total_lines}",
                 quiet,
             )
@@ -857,10 +859,15 @@ def download_for_line(
     reserved: set = set()
 
     def _producer():
+        scanned = 0
+        skipped_cached = 0
+        skipped_ext = 0
+        queued = 0
         try:
             for post in iter_candidate_posts(tags_query, cfg, max_posts):
                 if STOP_EVENT.is_set():
                     break
+                scanned += 1
                 url = pick_post_url(post, use_sample)
                 if not url:
                     continue
@@ -868,11 +875,14 @@ def download_for_line(
                 if ids_lock:
                     with ids_lock:
                         if candidate_id in downloaded_ids:
+                            skipped_cached += 1
                             continue
                 elif candidate_id in downloaded_ids:
+                    skipped_cached += 1
                     continue
                 ext = infer_extension(url)
                 if allowed_exts and ext.lower() not in allowed_exts:
+                    skipped_ext += 1
                     continue
                 post_tags = (post.get("tags") or "").strip()
                 tags_to_write = format_tags_csv(post_tags) if post_tags else format_tags_csv(tag_line)
@@ -880,12 +890,19 @@ def download_for_line(
                 image_path = output_dir / f"{name}{ext}"
                 tags_path = output_dir / f"{name}.txt"
                 job_queue.put((candidate_id, url, image_path, tags_path, tags_to_write))
+                queued += 1
         except Exception as exc:
             if progress:
                 progress.log_message(f"  Metadata error (continuing): {exc}", quiet)
             else:
                 log(f"Metadata fetch error (continuing with what we have): {exc}", quiet)
         finally:
+            if progress and scanned > 0:
+                progress.log_message(
+                    f"    Scanned {scanned} posts: {queued} new, "
+                    f"{skipped_cached} cached, {skipped_ext} wrong ext",
+                    quiet,
+                )
             producer_done.set()
 
     producer_thread = threading.Thread(target=_producer, daemon=True)
@@ -1232,8 +1249,7 @@ def main() -> int:
             idx, existing, success, attempted = run_one_line(item)
             total_success += success
             total_attempts += attempted
-            total_line = existing + success
-            progress.record_line_done(idx, total_line, args.per_line, args.quiet)
+            progress.record_line_done(idx, success, existing, args.per_line, args.quiet)
             time.sleep(0.1)
     else:
         line_pool = ThreadPoolExecutor(max_workers=line_workers)
@@ -1250,8 +1266,7 @@ def main() -> int:
                     continue
                 total_success += success
                 total_attempts += attempted
-                total_line = existing + success
-                progress.record_line_done(idx, total_line, args.per_line, args.quiet)
+                progress.record_line_done(idx, success, existing, args.per_line, args.quiet)
         except KeyboardInterrupt:
             STOP_EVENT.set()
             log("Interrupted while waiting line workers; canceling pending lines...", args.quiet)
