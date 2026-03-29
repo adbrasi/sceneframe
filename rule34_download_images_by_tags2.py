@@ -124,13 +124,26 @@ class ProgressTracker:
     def record_line_done(self, idx: int, line_total: int, per_line: int, quiet: bool) -> None:
         with self._lock:
             self.lines_done += 1
+            self._clear_line()
             log(
                 f"  Line {idx} done: {line_total}/{per_line} files "
                 f"| Overall: {self.lines_done}/{self.total_lines} lines",
                 quiet,
             )
 
+    def log_message(self, msg: str, quiet: bool) -> None:
+        """Print a message that won't be overwritten by progress bar."""
+        with self._lock:
+            self._clear_line()
+            log(msg, quiet)
+
+    @staticmethod
+    def _clear_line() -> None:
+        print("\r\033[K", end="", file=sys.stderr, flush=True)
+
     def _print_status(self, quiet: bool) -> None:
+        if quiet:
+            return
         elapsed = time.monotonic() - self.start_time
         if elapsed <= 0:
             return
@@ -138,7 +151,6 @@ class ProgressTracker:
         total = self.total_files
         pct = (done / total * 100) if total > 0 else 0
         speed_mbps = (self.bytes_downloaded / (1024 * 1024)) / elapsed
-        # ETA based on files completed rate.
         if done > 0:
             eta_sec = (elapsed / done) * (total - done)
             eta_str = format_duration(eta_sec)
@@ -148,12 +160,12 @@ class ProgressTracker:
         bar_len = 25
         filled = int(bar_len * done / total) if total > 0 else 0
         bar = "█" * filled + "░" * (bar_len - filled)
-        log(
-            f"  [{bar}] {done}/{total} files ({pct:.0f}%) "
+        line = (
+            f"  [{bar}] {done}/{total} ({pct:.0f}%) "
             f"| {total_mb:.0f} MB | {speed_mbps:.1f} MB/s "
-            f"| ETA {eta_str} | failed {self.files_failed}",
-            quiet,
+            f"| ETA {eta_str} | fail {self.files_failed}"
         )
+        print(f"\r\033[K{line}", end="", file=sys.stderr, flush=True)
 
 
 def load_creds(args: argparse.Namespace, quiet: bool) -> ApiCreds:
@@ -744,7 +756,10 @@ def download_for_line(
                 tags_path = output_dir / f"{name}.txt"
                 job_queue.put((candidate_id, url, image_path, tags_path, tags_to_write))
         except Exception as exc:
-            log(f"Metadata fetch error (continuing with what we have): {exc}", quiet)
+            if progress:
+                progress.log_message(f"  Metadata error (continuing): {exc}", quiet)
+            else:
+                log(f"Metadata fetch error (continuing with what we have): {exc}", quiet)
         finally:
             producer_done.set()
 
@@ -825,10 +840,9 @@ def download_for_line(
                 else:
                     if progress:
                         progress.record_failure(err, quiet)
-                    log(
-                        f"  FAIL: {err[:80]}",
-                        quiet,
-                    )
+                        progress.log_message(f"  FAIL: {err[:80]}", quiet)
+                    else:
+                        log(f"  FAIL: {err[:80]}", quiet)
             if success >= remaining or STOP_EVENT.is_set():
                 break
     except KeyboardInterrupt:
@@ -1042,7 +1056,7 @@ def main() -> int:
         idx, tag_line, existing, line_output_dir = item
         if STOP_EVENT.is_set():
             return idx, existing, 0, 0
-        log(f"\n[{idx}/{len(lines)}] {tag_line}", args.quiet)
+        progress.log_message(f"\n[{idx}/{len(lines)}] {tag_line}", args.quiet)
         success, attempted = download_for_line(
             tag_line,
             cfg,
