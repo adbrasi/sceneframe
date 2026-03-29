@@ -28,9 +28,8 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 API_BASE = "https://api.rule34.xxx/index.php"
-# Token embutido para rodar sem arquivo extra de credenciais.
-DEFAULT_RULE34_API_KEY = "efab5b3369af336475cb305f69d1128b4c9277284c6c0fd9e4f0ac98641a447385e826f24b54b2699e92a943119d040dcca298bf22e0d272ea72638506c8f398"
-DEFAULT_RULE34_USER_ID = "3808097"
+DEFAULT_RULE34_API_KEY = os.environ.get("RULE34_API_KEY", "")
+DEFAULT_RULE34_USER_ID = os.environ.get("RULE34_USER_ID", "")
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".m4v"}
 STOP_EVENT = threading.Event()
 _SIGINT_COUNT = 0
@@ -77,8 +76,11 @@ def load_creds(args: argparse.Namespace, quiet: bool) -> ApiCreds:
     if args.api_key and args.user_id:
         log("Using API credentials from CLI args.", quiet)
         return ApiCreds(api_key=args.api_key, user_id=args.user_id)
-    log("Using embedded Rule34 API credentials.", quiet)
-    return ApiCreds(api_key=DEFAULT_RULE34_API_KEY, user_id=DEFAULT_RULE34_USER_ID)
+    if DEFAULT_RULE34_API_KEY and DEFAULT_RULE34_USER_ID:
+        log("Using Rule34 API credentials from environment.", quiet)
+        return ApiCreds(api_key=DEFAULT_RULE34_API_KEY, user_id=DEFAULT_RULE34_USER_ID)
+    print("Error: credentials required. Set RULE34_API_KEY and RULE34_USER_ID env vars, or use --api-key and --user-id.", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def http_get_raw(
