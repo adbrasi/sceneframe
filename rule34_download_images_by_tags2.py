@@ -672,6 +672,8 @@ def download_for_line(
                 image_path = output_dir / f"{name}{ext}"
                 tags_path = output_dir / f"{name}.txt"
                 job_queue.put((candidate_id, url, image_path, tags_path, tags_to_write))
+        except Exception as exc:
+            log(f"Metadata fetch error (continuing with what we have): {exc}", quiet)
         finally:
             producer_done.set()
 
@@ -961,7 +963,7 @@ def main() -> int:
         idx, tag_line, existing, line_output_dir = item
         if STOP_EVENT.is_set():
             return idx, existing, 0, 0
-        log(f"[{idx}/{len(lines)}] {tag_line}", args.quiet)
+        log(f"\n[{idx}/{len(lines)}] {tag_line}", args.quiet)
         success, attempted = download_for_line(
             tag_line,
             cfg,
