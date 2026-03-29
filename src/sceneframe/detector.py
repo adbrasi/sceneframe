@@ -44,8 +44,12 @@ def _detect_scenes_transnet(video_path: Path) -> list[SceneBoundary]:
         return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
 
     boundaries = []
-    for start, end in scenes:
-        boundaries.append(SceneBoundary(start_frame=start, end_frame=end, fps=fps))
+    for scene in scenes:
+        boundaries.append(SceneBoundary(
+            start_frame=scene["start_frame"],
+            end_frame=scene["end_frame"],
+            fps=fps,
+        ))
     return boundaries
 
 
