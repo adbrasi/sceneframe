@@ -221,7 +221,10 @@ def iter_posts_by_tags(tags: str, cfg: FetchConfig, deleted: bool = False) -> It
         time.sleep(0.3)
 
 
-def load_tag_lines(path: Path) -> List[str]:
+def load_tag_lines(path: Path) -> Tuple[List[str], str]:
+    """Load tag lines from file. Lines starting with @global define tags
+    prepended to every query. Returns (lines, global_tags_string)."""
+    global_tags: List[str] = []
     lines: List[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -229,8 +232,17 @@ def load_tag_lines(path: Path) -> List[str]:
             continue
         if line.startswith("#"):
             continue
+        if line.lower().startswith("@global"):
+            # Everything after "@global" is a global tag list.
+            tags_part = line[len("@global"):].strip()
+            if tags_part:
+                global_tags.append(tags_part)
+            continue
         lines.append(line)
-    return lines
+    global_str = " ".join(global_tags).strip()
+    if global_str:
+        lines = [f"{global_str} {line}" for line in lines]
+    return lines, global_str
 
 
 def parse_line_selection(spec: str) -> Set[int]:
@@ -867,7 +879,9 @@ def main() -> int:
         print(f"Input file not found: {tag_file}", file=sys.stderr)
         return 2
 
-    lines = load_tag_lines(tag_file)
+    lines, global_tags = load_tag_lines(tag_file)
+    if global_tags:
+        log(f"Global tags: {global_tags}", args.quiet)
     if not lines:
         print("No tag lines found.", file=sys.stderr)
         return 2
