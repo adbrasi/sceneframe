@@ -1,4 +1,5 @@
 import logging
+import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,12 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 ENGINES = ("pyscenedetect", "transnetv2")
+
+# Default workers per engine (tuned for EPYC 48-96 core + RTX 5090/PRO 6000)
+DEFAULT_WORKERS = {
+    "pyscenedetect": None,  # cpu_count - 2 (set at runtime)
+    "transnetv2": 8,        # 6-8 optimal: ffmpeg decode is I/O bound, GPU inference is fast
+}
 
 # Singleton TransNetV2 model — loaded once, reused across all videos
 _transnet_model = None
@@ -81,55 +88,93 @@ def _get_transnet_model():
         return _transnet_model
 
 
-def _decode_frames_opencv(video_path: Path) -> tuple[np.ndarray, float, int]:
-    """Decode all frames from video using OpenCV, resized to 48x27 RGB.
-
-    Returns (frames_array, fps, total_frames).
-    frames_array shape: [N, 27, 48, 3] uint8 RGB.
-    """
+def _get_video_meta(video_path: Path) -> tuple[float, int]:
+    """Get FPS and total frame count from video metadata (no frame decoding)."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
-
+        return 0.0, 0
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
-
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            small = cv2.resize(rgb, (48, 27))
-            frames.append(small)
-
-        if not frames:
-            return np.empty((0, 27, 48, 3), dtype=np.uint8), fps, 0
-
-        return np.array(frames, dtype=np.uint8), fps, len(frames)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        return fps, total
     finally:
         cap.release()
 
 
-def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
-    """Detect scenes using TransNetV2 on GPU with OpenCV decoding."""
-    import torch
+def _decode_frames_ffmpeg(video_path: Path, w: int = 48, h: int = 27) -> np.ndarray | None:
+    """Decode all frames via ffmpeg subprocess pipe, resized to w×h RGB.
 
+    This is the same approach used internally by TransNetV2's predict_video().
+    FFmpeg decode runs natively in C — orders of magnitude faster than
+    Python frame-by-frame OpenCV. Each thread spawns its own ffmpeg process
+    so this is fully thread-safe.
+
+    Returns ndarray [N, h, w, 3] uint8 RGB, or None on failure.
+    """
+    cmd = [
+        "ffmpeg",
+        "-i", str(video_path),
+        "-vf", f"scale={w}:{h}",
+        "-pix_fmt", "rgb24",
+        "-f", "rawvideo",
+        "-loglevel", "error",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=300)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logger.warning("ffmpeg decode failed for %s: %s", video_path.name, e)
+        return None
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode(errors="replace").strip()
+        logger.warning("ffmpeg error for %s: %s", video_path.name, stderr[:200])
+        return None
+
+    raw = proc.stdout
+    if len(raw) == 0:
+        return None
+
+    frame_bytes = h * w * 3
+    n_frames = len(raw) // frame_bytes
+    if n_frames == 0:
+        return None
+
+    return np.frombuffer(raw, dtype=np.uint8).reshape(n_frames, h, w, 3)
+
+
+def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
+    """Detect scenes using TransNetV2 on GPU with ffmpeg pipe decoding.
+
+    Pipeline:
+    1. ffmpeg subprocess decodes + scales to 48×27 RGB (thread-safe, parallel)
+    2. predict_frames() runs GPU inference (serialized via lock)
+    3. predictions_to_scenes() converts to scene boundaries (CPU, no lock)
+
+    TransNetV2 already detects dissolves and gradual transitions, so
+    re_detect_long_scenes is NOT needed when using this engine.
+    """
     model = _get_transnet_model()
 
-    # Decode on CPU (thread-safe, each thread has its own VideoCapture)
-    frames, fps, total_frames = _decode_frames_opencv(video_path)
-    if total_frames == 0 or fps <= 0:
+    # Get FPS from video metadata (no frame decoding)
+    fps, total_frames = _get_video_meta(video_path)
+    if fps <= 0 or total_frames <= 0:
         return []
 
-    # GPU inference with lock (CUDA not thread-safe for concurrent writes)
-    frames_tensor = torch.from_numpy(frames)
-    with _inference_lock:
-        frames_tensor = frames_tensor.to(model.device)
-        with torch.no_grad():
-            single_pred, _ = model.predict_frames(frames_tensor)
+    # Decode frames via ffmpeg subprocess (thread-safe, runs in parallel)
+    frames = _decode_frames_ffmpeg(video_path)
+    if frames is None:
+        return []
 
-    scenes_array = model.predictions_to_scenes(single_pred.cpu().numpy())
+    # GPU inference with lock (CUDA not thread-safe for concurrent kernels)
+    with _inference_lock:
+        single_pred, _ = model.predict_frames(frames)
+
+    # predictions_to_scenes expects numpy; predict_frames may return tensor
+    if hasattr(single_pred, "cpu"):
+        single_pred = single_pred.cpu().numpy()
+
+    scenes_array = model.predictions_to_scenes(single_pred)
 
     if len(scenes_array) == 0:
         return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
@@ -186,6 +231,9 @@ def re_detect_long_scenes(
 
     Uses AdaptiveDetector with a lower threshold on the long segments.
     Short scenes pass through unchanged.
+
+    NOTE: This is only useful for PySceneDetect. TransNetV2 already detects
+    dissolves and gradual transitions, making this step redundant.
     """
     video_path = Path(video_path)
     if not video_path.exists():

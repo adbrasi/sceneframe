@@ -13,7 +13,7 @@ import click
 import cv2
 from tqdm import tqdm
 
-from .detector import SceneBoundary
+from .detector import DEFAULT_WORKERS, SceneBoundary
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,9 @@ def _detect_scenes_for_video(video_path: Path, engine: str = "pyscenedetect") ->
     from .detector import detect_scenes, re_detect_long_scenes
 
     scenes = detect_scenes(video_path, engine=engine, show_progress=False)
-    if scenes:
+    # TransNetV2 already detects dissolves/gradual transitions — re_detect is
+    # redundant and expensive (reopens video + runs PySceneDetect CPU per scene).
+    if scenes and engine != "transnetv2":
         scenes = re_detect_long_scenes(video_path, scenes, max_seconds=20.0)
     return video_path, scenes
 
@@ -302,7 +304,11 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
             raise SystemExit(0)
 
     cpu_count = os.cpu_count() or 4
-    max_workers = workers if workers else max(1, cpu_count - 2)
+    if workers:
+        max_workers = workers
+    else:
+        engine_default = DEFAULT_WORKERS.get(engine)
+        max_workers = engine_default if engine_default else max(1, cpu_count - 2)
     max_workers = min(max_workers, len(videos))
 
     pairs_info = f" (max {max_pairs}/video)" if max_pairs else ""
