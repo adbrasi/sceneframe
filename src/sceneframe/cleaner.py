@@ -386,6 +386,9 @@ def retry_nsfw_pairs(
             if should_flag:
                 flagged_suffixes.setdefault(lbl, set()).add(suffix)
 
+    # Labels with no flagged suffixes already pass — no retry needed
+    already_pass = retryable - set(flagged_suffixes.keys())
+
     # Group by video to open each one only once
     by_video: dict[str, list[str]] = {}
     for label in flagged_suffixes:
@@ -501,6 +504,7 @@ def retry_nsfw_pairs(
             stale_path.unlink(missing_ok=True)
 
     # Step 5: For pairs that still fail, delete temp files (originals are untouched)
+    now_pass = now_pass | already_pass
     still_fail = retryable - now_pass
     for label in still_fail:
         if label not in replaced:
@@ -546,7 +550,7 @@ def clean_directory(
 
     Steps (in order):
     1. Remove solid-color pairs
-    2. Remove duplicate pairs (dhash)
+    2. Remove duplicate pairs (cosine similarity)
     3. NSFW filter (optional)
     4. Remove orphaned pairs (missing A or B)
 
