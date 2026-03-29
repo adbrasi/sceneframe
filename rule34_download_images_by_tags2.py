@@ -34,13 +34,13 @@ DEFAULT_RULE34_API_KEY = os.environ.get("RULE34_API_KEY", "")
 DEFAULT_RULE34_USER_ID = os.environ.get("RULE34_USER_ID", "")
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".m4v"}
 # Connection pools with keep-alive for maximum throughput on high-bandwidth links.
-_API_POOL = urllib3.HTTPSPoolManager(
+_API_POOL = urllib3.PoolManager(
     num_pools=4,
     maxsize=64,
     retries=False,
     headers={"User-Agent": "rule34-media-downloader/1.0"},
 )
-_CDN_POOL = urllib3.HTTPSPoolManager(
+_CDN_POOL = urllib3.PoolManager(
     num_pools=8,
     maxsize=128,
     retries=False,
