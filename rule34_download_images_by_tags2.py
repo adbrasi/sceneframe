@@ -87,6 +87,75 @@ def log(msg: str, quiet: bool) -> None:
         print(msg, file=sys.stderr, flush=True)
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m{s:02d}s"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
+
+
+class ProgressTracker:
+    """Thread-safe progress tracker with ETA calculation."""
+
+    def __init__(self, total_files: int, total_lines: int):
+        self._lock = threading.Lock()
+        self.total_files = total_files
+        self.total_lines = total_lines
+        self.files_done = 0
+        self.files_failed = 0
+        self.lines_done = 0
+        self.bytes_downloaded = 0
+        self.start_time = time.monotonic()
+
+    def record_download(self, size_bytes: int, elapsed: float, quiet: bool) -> None:
+        with self._lock:
+            self.files_done += 1
+            self.bytes_downloaded += size_bytes
+            self._print_status(quiet)
+
+    def record_failure(self, err: str, quiet: bool) -> None:
+        with self._lock:
+            self.files_failed += 1
+
+    def record_line_done(self, idx: int, line_total: int, per_line: int, quiet: bool) -> None:
+        with self._lock:
+            self.lines_done += 1
+            log(
+                f"  Line {idx} done: {line_total}/{per_line} files "
+                f"| Overall: {self.lines_done}/{self.total_lines} lines",
+                quiet,
+            )
+
+    def _print_status(self, quiet: bool) -> None:
+        elapsed = time.monotonic() - self.start_time
+        if elapsed <= 0:
+            return
+        done = self.files_done
+        total = self.total_files
+        pct = (done / total * 100) if total > 0 else 0
+        speed_mbps = (self.bytes_downloaded / (1024 * 1024)) / elapsed
+        # ETA based on files completed rate.
+        if done > 0:
+            eta_sec = (elapsed / done) * (total - done)
+            eta_str = format_duration(eta_sec)
+        else:
+            eta_str = "..."
+        total_mb = self.bytes_downloaded / (1024 * 1024)
+        bar_len = 25
+        filled = int(bar_len * done / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
+        log(
+            f"  [{bar}] {done}/{total} files ({pct:.0f}%) "
+            f"| {total_mb:.0f} MB | {speed_mbps:.1f} MB/s "
+            f"| ETA {eta_str} | failed {self.files_failed}",
+            quiet,
+        )
+
+
 def load_creds(args: argparse.Namespace, quiet: bool) -> ApiCreds:
     if args.api_key and args.user_id:
         log("Using API credentials from CLI args.", quiet)
@@ -630,6 +699,7 @@ def download_for_line(
     name_lock: Optional[threading.Lock],
     chunk_bytes: int,
     quiet: bool,
+    progress: Optional["ProgressTracker"] = None,
 ) -> Tuple[int, int]:
     if STOP_EVENT.is_set():
         return 0, 0
@@ -746,15 +816,17 @@ def download_for_line(
                         elif candidate_id not in downloaded_ids:
                             downloaded_ids.add(candidate_id)
                             append_id_cache(ids_cache_path, candidate_id)
-                    log(
-                        f"Saved {size / (1024 * 1024):.1f} MB in {elapsed:.1f}s",
-                        quiet,
-                    )
+                    if progress:
+                        progress.record_download(size, elapsed, quiet)
+                    else:
+                        log(f"Saved {size / (1024 * 1024):.1f} MB in {elapsed:.1f}s", quiet)
                     if success >= remaining:
                         break
                 else:
+                    if progress:
+                        progress.record_failure(err, quiet)
                     log(
-                        f"Download failed after {elapsed:.1f}s ({size / (1024 * 1024):.1f} MB): {err}",
+                        f"  FAIL: {err[:80]}",
                         quiet,
                     )
             if success >= remaining or STOP_EVENT.is_set():
@@ -923,7 +995,12 @@ def main() -> int:
 
     total_success = 0
     total_attempts = 0
-    log(f"Processing {len(indexed_lines)} selected tag lines...", args.quiet)
+    # Calculate total expected files for progress tracking.
+    total_expected_files = 0
+    for pos, (_idx, _line) in enumerate(indexed_lines):
+        existing = existing_counts[pos] if pos < len(existing_counts) else 0
+        total_expected_files += max(0, args.per_line - existing)
+    log(f"Processing {len(indexed_lines)} tag lines | Target: {total_expected_files} files", args.quiet)
 
     max_bytes = None
     if args.max_size_mb and args.max_size_mb > 0:
@@ -952,6 +1029,7 @@ def main() -> int:
     name_lock = threading.Lock()
     global_reserved_names: Set[str] = set()
     inflight_ids: Set[str] = set()
+    progress = ProgressTracker(total_files=total_expected_files, total_lines=len(indexed_lines))
 
     line_items = []
     for pos, (idx, tag_line) in enumerate(indexed_lines):
@@ -989,6 +1067,7 @@ def main() -> int:
             name_lock,
             chunk_bytes,
             args.quiet,
+            progress,
         )
         return idx, existing, success, attempted
 
@@ -1000,7 +1079,7 @@ def main() -> int:
             total_success += success
             total_attempts += attempted
             total_line = existing + success
-            log(f"Downloaded {total_line}/{args.per_line} for line {idx}", args.quiet)
+            progress.record_line_done(idx, total_line, args.per_line, args.quiet)
             time.sleep(0.1)
     else:
         line_pool = ThreadPoolExecutor(max_workers=line_workers)
@@ -1018,7 +1097,7 @@ def main() -> int:
                 total_success += success
                 total_attempts += attempted
                 total_line = existing + success
-                log(f"Downloaded {total_line}/{args.per_line} for line {idx}", args.quiet)
+                progress.record_line_done(idx, total_line, args.per_line, args.quiet)
         except KeyboardInterrupt:
             STOP_EVENT.set()
             log("Interrupted while waiting line workers; canceling pending lines...", args.quiet)
@@ -1028,10 +1107,24 @@ def main() -> int:
                     future.cancel()
             line_pool.shutdown(wait=not STOP_EVENT.is_set(), cancel_futures=True)
 
+    elapsed = time.monotonic() - progress.start_time
+    total_mb = progress.bytes_downloaded / (1024 * 1024)
+    avg_speed = total_mb / elapsed if elapsed > 0 else 0
     if STOP_EVENT.is_set():
-        log(f"Interrupted. Partial result: downloads={total_success}, attempts={total_attempts}", args.quiet)
+        log(
+            f"\nInterrupted after {format_duration(elapsed)}. "
+            f"Downloads: {total_success}/{total_expected_files} | "
+            f"{total_mb:.0f} MB | avg {avg_speed:.1f} MB/s",
+            args.quiet,
+        )
         os._exit(130)
-    log(f"Done. Downloads: {total_success}. Attempts: {total_attempts}.", args.quiet)
+    log(
+        f"\nDone in {format_duration(elapsed)}! "
+        f"Downloads: {total_success}/{total_expected_files} | "
+        f"{total_mb:.0f} MB | avg {avg_speed:.1f} MB/s | "
+        f"failed: {progress.files_failed}",
+        args.quiet,
+    )
     return 0 if total_success > 0 else 1
 
 
