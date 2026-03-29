@@ -41,8 +41,8 @@ _API_POOL = urllib3.PoolManager(
     headers={"User-Agent": "rule34-media-downloader/1.0"},
 )
 _CDN_POOL = urllib3.PoolManager(
-    num_pools=8,
-    maxsize=128,
+    num_pools=20,
+    maxsize=600,
     retries=False,
     headers={"User-Agent": "rule34-image-downloader/1.0"},
 )
@@ -103,6 +103,7 @@ class ProgressTracker:
 
     def __init__(self, total_files: int, total_lines: int):
         self._lock = threading.Lock()
+        self._is_tty = sys.stderr.isatty()
         self.total_files = total_files
         self.total_lines = total_lines
         self.files_done = 0
@@ -170,6 +171,13 @@ class ProgressTracker:
             return
         elapsed = time.monotonic() - self.start_time
         if elapsed <= 0:
+            return
+        if not self._is_tty:
+            # Non-TTY: print simple progress every 50 files.
+            done = self.files_done
+            if done % 50 == 0 or done == self.total_files:
+                total_mb = self.bytes_downloaded / (1024 * 1024)
+                log(f"  Progress: {done}/{self.total_files} files | {total_mb:.0f} MB", False)
             return
 
         lines_out = []
@@ -655,6 +663,39 @@ def cleanup_videos_by_constraints(
     return removed_total, removed_by_size, removed_by_duration, scanned_videos
 
 
+CDN_THROTTLE_EVENT = threading.Event()
+CDN_THROTTLE_UNTIL = 0.0
+CDN_THROTTLE_LOCK = threading.Lock()
+CHUNK_STALL_TIMEOUT = 30.0  # seconds without receiving data = stalled
+
+
+def _cdn_throttle_backoff(retry_after: Optional[str]) -> None:
+    """Signal all CDN workers to pause when throttled."""
+    wait_sec = 10.0
+    if retry_after:
+        try:
+            wait_sec = min(float(retry_after), 60.0)
+        except ValueError:
+            pass
+    with CDN_THROTTLE_LOCK:
+        global CDN_THROTTLE_UNTIL
+        until = time.monotonic() + wait_sec
+        if until > CDN_THROTTLE_UNTIL:
+            CDN_THROTTLE_UNTIL = until
+    CDN_THROTTLE_EVENT.set()
+
+
+def _wait_cdn_throttle() -> None:
+    """Block if CDN throttle is active."""
+    if not CDN_THROTTLE_EVENT.is_set():
+        return
+    with CDN_THROTTLE_LOCK:
+        remaining = CDN_THROTTLE_UNTIL - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+    CDN_THROTTLE_EVENT.clear()
+
+
 def download_job(
     url: str,
     image_path: Path,
@@ -665,63 +706,103 @@ def download_job(
     max_bytes: Optional[int],
     min_bytes: Optional[int],
     chunk_bytes: int,
+    cdn_retries: int = 3,
 ) -> Tuple[bool, int, float, str]:
     if STOP_EVENT.is_set():
         return False, 0, 0.0, "Interrupted"
+
     tmp_path = image_path.with_suffix(image_path.suffix + ".part")
     start = time.time()
-    total_bytes = 0
-    resp = None
-    try:
-        resp = _CDN_POOL.request("GET", url, timeout=timeout, preload_content=False)
-        if resp.status >= 400:
-            raise RuntimeError(f"HTTP {resp.status}")
-        content_length = resp.headers.get("Content-Length")
-        if content_length:
-            try:
-                size = int(content_length)
-            except Exception:
-                size = 0
-            if max_bytes and size > max_bytes:
-                return False, 0, time.time() - start, f"Skipped: size {size} bytes exceeds max limit"
-            if min_bytes and size > 0 and size < min_bytes:
-                return False, 0, time.time() - start, f"Skipped: size {size} bytes below min limit"
-        with tmp_path.open("wb") as f:
-            for chunk in resp.stream(chunk_bytes):
-                if STOP_EVENT.is_set():
-                    raise RuntimeError("Interrupted")
-                f.write(chunk)
-                total_bytes += len(chunk)
-                if max_bytes and total_bytes > max_bytes:
-                    raise RuntimeError("Size limit exceeded")
-                if download_timeout and (time.time() - start) > download_timeout:
-                    raise TimeoutError(f"Download exceeded {download_timeout:.0f}s")
-        if min_bytes and total_bytes < min_bytes:
-            tmp_path.unlink(missing_ok=True)
-            return False, total_bytes, time.time() - start, f"Skipped: size {total_bytes} bytes below min limit"
-        tmp_path.replace(image_path)
-        tags_path.write_text(tag_text + "\n", encoding="utf-8")
-        return True, total_bytes, time.time() - start, ""
-    except Exception as exc:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
-        if image_path.exists():
-            try:
-                image_path.unlink()
-            except Exception:
-                pass
-        if tags_path.exists():
-            try:
-                tags_path.unlink()
-            except Exception:
-                pass
-        return False, total_bytes, time.time() - start, str(exc)
-    finally:
-        if resp is not None:
-            resp.release_conn()
+
+    for attempt in range(1, cdn_retries + 1):
+        if STOP_EVENT.is_set():
+            return False, 0, 0.0, "Interrupted"
+        # Respect global CDN throttle signal.
+        _wait_cdn_throttle()
+
+        total_bytes = 0
+        resp = None
+        try:
+            resp = _CDN_POOL.request("GET", url, timeout=timeout, preload_content=False)
+            # Handle CDN throttling (429/503) with backoff.
+            if resp.status in (429, 503):
+                ra = resp.headers.get("Retry-After")
+                _cdn_throttle_backoff(ra)
+                resp.release_conn()
+                resp = None
+                if attempt < cdn_retries:
+                    continue
+                return False, 0, time.time() - start, f"CDN throttled (HTTP {resp.status if resp else 429})"
+            if resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status}")
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    size = int(content_length)
+                except Exception:
+                    size = 0
+                if max_bytes and size > max_bytes:
+                    return False, 0, time.time() - start, f"Skipped: size {size} bytes exceeds max limit"
+                if min_bytes and size > 0 and size < min_bytes:
+                    return False, 0, time.time() - start, f"Skipped: size {size} bytes below min limit"
+            last_chunk_time = time.time()
+            with tmp_path.open("wb") as f:
+                for chunk in resp.stream(chunk_bytes):
+                    if STOP_EVENT.is_set():
+                        raise RuntimeError("Interrupted")
+                    now = time.time()
+                    # Detect stalled transfers (CDN throttling via slow trickle).
+                    if now - last_chunk_time > CHUNK_STALL_TIMEOUT:
+                        raise TimeoutError(f"Chunk stall: no data for {CHUNK_STALL_TIMEOUT:.0f}s")
+                    last_chunk_time = now
+                    f.write(chunk)
+                    total_bytes += len(chunk)
+                    if max_bytes and total_bytes > max_bytes:
+                        raise RuntimeError("Size limit exceeded")
+                    if download_timeout and (now - start) > download_timeout:
+                        raise TimeoutError(f"Download exceeded {download_timeout:.0f}s")
+            if min_bytes and total_bytes < min_bytes:
+                tmp_path.unlink(missing_ok=True)
+                return False, total_bytes, time.time() - start, f"Skipped: size {total_bytes} bytes below min limit"
+            tmp_path.replace(image_path)
+            tags_path.write_text(tag_text + "\n", encoding="utf-8")
+            return True, total_bytes, time.time() - start, ""
+        except (TimeoutError, OSError) as exc:
+            # Retriable errors: stall, timeout, connection reset.
+            if resp is not None:
+                resp.release_conn()
+                resp = None
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+            if attempt < cdn_retries and not STOP_EVENT.is_set():
+                time.sleep(min(2.0 * attempt, 10.0))
+                continue
+            return False, total_bytes, time.time() - start, str(exc)
+        except Exception as exc:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+            if image_path.exists():
+                try:
+                    image_path.unlink()
+                except Exception:
+                    pass
+            if tags_path.exists():
+                try:
+                    tags_path.unlink()
+                except Exception:
+                    pass
+            return False, total_bytes, time.time() - start, str(exc)
+        finally:
+            if resp is not None:
+                resp.release_conn()
+
+    return False, 0, time.time() - start, f"CDN failed after {cdn_retries} attempts"
 
 
 def iter_candidate_posts(tags: str, cfg: FetchConfig, max_posts: int) -> Iterable[dict]:
@@ -779,7 +860,7 @@ def download_for_line(
     max_posts = max(remaining * candidate_factor, remaining)
 
     # Pipeline: producer thread fetches metadata while consumer threads download.
-    job_queue: queue.Queue = queue.Queue(maxsize=max_workers * 2)
+    job_queue: queue.Queue = queue.Queue(maxsize=max_workers * 8)
     producer_done = threading.Event()
 
     reserved: set = set()
@@ -875,15 +956,18 @@ def download_for_line(
                     inflight_ids.discard(candidate_id)
                 if ok:
                     success += 1
+                    should_cache = False
                     if candidate_id:
                         if ids_lock:
                             with ids_lock:
                                 if candidate_id not in downloaded_ids:
                                     downloaded_ids.add(candidate_id)
-                                    append_id_cache(ids_cache_path, candidate_id)
+                                    should_cache = True
                         elif candidate_id not in downloaded_ids:
                             downloaded_ids.add(candidate_id)
-                            append_id_cache(ids_cache_path, candidate_id)
+                            should_cache = True
+                    if should_cache:
+                        append_id_cache(ids_cache_path, candidate_id)
                     if progress:
                         progress.record_download(size, elapsed, line_idx, quiet)
                     else:
