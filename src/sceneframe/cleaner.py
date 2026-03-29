@@ -98,7 +98,7 @@ def _compute_feature_vector(image: np.ndarray) -> np.ndarray:
 
 def find_duplicate_labels(
     directory: Path,
-    similarity: float = 0.96,
+    similarity: float = 0.93,
     workers: int = 8,
     chunk_size: int = 1000,
 ) -> set[str]:
@@ -272,6 +272,183 @@ def find_nsfw_labels(
 
 
 # ---------------------------------------------------------------------------
+# NSFW retry: try alternative frames before giving up
+# ---------------------------------------------------------------------------
+
+def _load_metadata(directory: Path) -> dict[str, dict]:
+    """Load pairs_metadata.jsonl into a label-keyed dict."""
+    import json
+
+    meta_path = directory / "pairs_metadata.jsonl"
+    if not meta_path.exists():
+        return {}
+
+    metadata = {}
+    for line in meta_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        entry = json.loads(line)
+        metadata[entry["label"]] = entry
+    return metadata
+
+
+def retry_nsfw_pairs(
+    directory: Path,
+    labels_to_retry: set[str],
+    keep_nsfw: bool = True,
+    batch_size: int = 32,
+    device: str | None = None,
+    confidence: float = 0.5,
+) -> set[str]:
+    """Try alternative frames for pairs that failed NSFW filter.
+
+    For each failed pair, reads the metadata to find the source video,
+    extracts a frame ~1s forward/backward within scene bounds, re-classifies
+    it, and replaces the image if it now passes.
+
+    Returns the set of labels that STILL need to be removed (retry failed).
+    """
+    try:
+        import torch  # noqa: F401
+        from PIL import Image
+        from transformers import pipeline
+    except ImportError:
+        raise RuntimeError(
+            "NSFW retry requires torch and transformers. "
+            "Install with: pip install torch transformers Pillow"
+        )
+
+    metadata = _load_metadata(directory)
+    if not metadata:
+        logger.warning("No pairs_metadata.jsonl found — cannot retry NSFW pairs")
+        return labels_to_retry
+
+    # Filter to labels that have metadata
+    retryable = {l for l in labels_to_retry if l in metadata}
+    no_metadata = labels_to_retry - retryable
+
+    if no_metadata:
+        logger.info("No metadata for %d pairs — will be removed without retry", len(no_metadata))
+    if not retryable:
+        return labels_to_retry
+
+    logger.info("Retrying NSFW for %d pairs with alternative frames...", len(retryable))
+
+    if device is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Group by video to open each one only once
+    by_video: dict[str, list[str]] = {}
+    for label in retryable:
+        video = metadata[label]["video"]
+        by_video.setdefault(video, []).append(label)
+
+    # Extract alternative frames
+    JPEG_QUALITY = 95
+    replaced_labels: set[str] = set()  # labels where we replaced at least one frame
+
+    for video_path_str, video_labels in by_video.items():
+        video_path = Path(video_path_str)
+        if not video_path.exists():
+            logger.warning("Video not found for retry: %s", video_path)
+            continue
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            logger.warning("Cannot open video for retry: %s", video_path)
+            continue
+
+        try:
+            for label in video_labels:
+                meta = metadata[label]
+                fps = meta["fps"]
+                offset = max(1, round(fps))
+
+                # Try both frames (A and B)
+                for suffix, frame_key in [("A", "frame_a"), ("B", "frame_b")]:
+                    frame_info = meta[frame_key]
+                    idx = frame_info["index"]
+                    scene_start = frame_info["scene_start"]
+                    scene_end = frame_info["scene_end"]
+
+                    # Try forward, then backward
+                    for direction in (offset, -offset):
+                        alt_idx = idx + direction
+                        if alt_idx < scene_start or alt_idx >= scene_end:
+                            continue
+
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
+                        ret, alt_frame = cap.read()
+                        if not ret:
+                            continue
+
+                        # Save the alternative frame temporarily
+                        img_path = directory / f"{label}_{suffix}.jpg"
+                        cv2.imwrite(
+                            str(img_path), alt_frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+                        )
+                        replaced_labels.add(label)
+                        break  # got a replacement, stop trying directions
+        finally:
+            cap.release()
+
+    if not replaced_labels:
+        logger.info("No alternative frames found — all retry pairs will be removed")
+        return labels_to_retry
+
+    # Re-classify the replaced pairs
+    logger.info("Re-classifying %d pairs with replacement frames...", len(replaced_labels))
+
+    classifier = pipeline(
+        "image-classification",
+        model="Falconsai/nsfw_image_detection",
+        device=device,
+        batch_size=batch_size,
+    )
+
+    # Collect images for reclassification
+    all_labels: list[str] = []
+    all_paths: list[Path] = []
+    for label in sorted(replaced_labels):
+        for suffix in ("A", "B"):
+            path = directory / f"{label}_{suffix}.jpg"
+            if path.exists():
+                all_labels.append(label)
+                all_paths.append(path)
+
+    nsfw_labels: set[str] = set()
+    for i in range(0, len(all_paths), batch_size):
+        batch_paths = all_paths[i : i + batch_size]
+        batch_labels = all_labels[i : i + batch_size]
+        images = [Image.open(p).convert("RGB") for p in batch_paths]
+
+        results = classifier(images)
+        for lbl, result in zip(batch_labels, results):
+            top = max(result, key=lambda x: x["score"])
+            if top["label"] == "nsfw" and top["score"] >= confidence:
+                nsfw_labels.add(lbl)
+
+    # Determine which replaced pairs now pass
+    if keep_nsfw:
+        # Want NSFW: pairs that are now NSFW pass
+        now_pass = nsfw_labels & replaced_labels
+    else:
+        # Want SFW: pairs that are now SFW pass
+        now_pass = replaced_labels - nsfw_labels
+
+    still_fail = retryable - now_pass
+    logger.info("NSFW retry: %d saved, %d still removed", len(now_pass), len(still_fail))
+
+    # Restore original frames for pairs that still fail
+    # (they were overwritten with alternatives, but will be deleted anyway)
+
+    return still_fail | no_metadata
+
+
+# ---------------------------------------------------------------------------
 # Orphan cleanup
 # ---------------------------------------------------------------------------
 
@@ -335,15 +512,28 @@ def clean_directory(
         all_to_remove.update(dups)
         logger.info("Duplicate pairs to remove: %d", len(new_dups))
 
-    # Step 3: NSFW filter
+    # Step 3: NSFW filter (with retry)
     if nsfw:
         nsfw_labels = find_nsfw_labels(
             directory, keep_nsfw, nsfw_batch_size, nsfw_device, nsfw_confidence
         )
         new_nsfw = nsfw_labels - all_to_remove
-        stats["nsfw_removed"] = len(new_nsfw)
-        all_to_remove.update(nsfw_labels)
-        logger.info("NSFW filtered pairs to remove: %d", len(new_nsfw))
+
+        # Retry: try alternative frames before giving up
+        if new_nsfw:
+            still_remove = retry_nsfw_pairs(
+                directory, new_nsfw,
+                keep_nsfw=keep_nsfw,
+                batch_size=nsfw_batch_size,
+                device=nsfw_device,
+                confidence=nsfw_confidence,
+            )
+        else:
+            still_remove = set()
+
+        stats["nsfw_removed"] = len(still_remove)
+        all_to_remove.update(still_remove)
+        logger.info("NSFW filtered pairs to remove: %d (after retry)", len(still_remove))
 
     # Delete marked files
     if not dry_run and all_to_remove:

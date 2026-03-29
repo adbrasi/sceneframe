@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 
@@ -12,6 +13,37 @@ logger = logging.getLogger(__name__)
 FRAME_OFFSET = 3
 JPEG_QUALITY = 95
 SOLID_THRESHOLD = 20.0
+METADATA_FILE = "pairs_metadata.jsonl"
+
+
+def _write_metadata(
+    output_dir: Path,
+    label: str,
+    video_path: Path,
+    frame_a_idx: int,
+    frame_b_idx: int,
+    scene_a: SceneBoundary,
+    scene_b: SceneBoundary,
+) -> None:
+    """Append pair metadata to JSONL file for later use by clean retry."""
+    meta = {
+        "label": label,
+        "video": str(video_path.resolve()),
+        "frame_a": {
+            "index": frame_a_idx,
+            "scene_start": scene_a.start_frame,
+            "scene_end": scene_a.end_frame,
+        },
+        "frame_b": {
+            "index": frame_b_idx,
+            "scene_start": scene_b.start_frame,
+            "scene_end": scene_b.end_frame,
+        },
+        "fps": scene_a.fps,
+    }
+    meta_path = output_dir / METADATA_FILE
+    with open(meta_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(meta) + "\n")
 
 
 def extract_frame(video_path: Path, frame_index: int) -> np.ndarray | None:
@@ -138,6 +170,7 @@ def extract_intra_scene_pairs(
             label = f"{start_index + pair_count:06d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
+            _write_metadata(output_dir, label, video_path, start_idx, end_idx, scene, scene)
     finally:
         cap.release()
 
@@ -205,6 +238,7 @@ def extract_inter_scene_pairs_sequential(
             label = f"{start_index + pair_count:06d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
+            _write_metadata(output_dir, label, video_path, idx_a, idx_b, scene_a, scene_b)
     finally:
         cap.release()
 
@@ -274,6 +308,7 @@ def extract_inter_scene_pairs_sliding(
             label = f"{start_index + pair_count:06d}"
             _save_frame(frame_a, output_dir / f"{label}_A.jpg")
             _save_frame(frame_b, output_dir / f"{label}_B.jpg")
+            _write_metadata(output_dir, label, video_path, idx_a, idx_b, scene_a, scene_b)
     finally:
         cap.release()
 
