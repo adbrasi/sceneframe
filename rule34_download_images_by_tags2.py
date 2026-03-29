@@ -226,7 +226,8 @@ def load_tag_lines(path: Path) -> Tuple[List[str], str]:
     prepended to every query. Returns (lines, global_tags_string)."""
     global_tags: List[str] = []
     lines: List[str] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    text = path.read_text(encoding="utf-8-sig")  # utf-8-sig strips BOM automatically
+    for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
