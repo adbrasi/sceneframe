@@ -421,9 +421,10 @@ def clean(
 
 @cli.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--percentage", "-p", type=float, default=100.0, show_default=True, help="Total % of _B images that receive a _C control image (0-100).")
-@click.option("--depth", type=float, default=100.0, show_default=True, help="% of selected images that get depth maps. Must sum to 100 with --canny.")
-@click.option("--canny", type=float, default=0.0, show_default=True, help="% of selected images that get canny edges. Must sum to 100 with --depth.")
+@click.option("--percentage", "-p", type=float, default=100.0, show_default=True, help="Total % of _B images that receive a control image (0-100).")
+@click.option("--depth", type=float, default=100.0, show_default=True, help="% of selected images that get depth maps. Must sum to 100 with --canny and --image-base.")
+@click.option("--canny", type=float, default=0.0, show_default=True, help="% of selected images that get canny edges. Must sum to 100 with --depth and --image-base.")
+@click.option("--image-base", type=float, default=0.0, show_default=True, help="% of selected images that get a copy of _A as _image_base.jpg. Must sum to 100 with --depth and --canny.")
 @click.option("--batch-size", "-b", type=int, default=8, show_default=True, help="Batch size for depth GPU inference.")
 @click.option("--device", type=str, default=None, help="Device for depth inference (cuda/cpu). Auto-detects if not set.")
 @click.option(
@@ -441,6 +442,7 @@ def control(
     percentage: float,
     depth: float,
     canny: float,
+    image_base: float,
     batch_size: int,
     device: str | None,
     model: str,
@@ -448,19 +450,24 @@ def control(
     canny_high: int,
     seed: int | None,
 ):
-    """Generate control images (_C.jpg) from _B images using depth and/or canny.
+    """Generate control images from _B images using depth, canny, and/or image_base.
 
     DIRECTORY should contain image pairs named NNNNNN_A.jpg / NNNNNN_B.jpg.
 
-    First, --percentage selects how many _B images receive a _C.
-    Then, --depth and --canny split that selection (must sum to 100).
+    First, --percentage selects how many _B images are processed.
+    Then, --depth, --canny, and --image-base split that selection (must sum to 100).
+
+    \b
+    Control types:
+      depth      → depth map saved as _C.jpg (GPU, Depth Anything V2)
+      canny      → canny edges saved as _C.jpg (CPU, OpenCV)
+      image-base → copy of _A saved as _image_base.jpg
 
     \b
     Examples:
-      sceneframe control ./output                              # 100% depth
-      sceneframe control ./output -p 50                        # 50% depth
-      sceneframe control ./output -p 50 --depth 50 --canny 50  # 25% depth + 25% canny
-      sceneframe control ./output -p 100 --depth 0 --canny 100 # 100% canny
+      sceneframe control ./output                                            # 100% depth
+      sceneframe control ./output -p 50 --depth 50 --canny 50               # 25% depth + 25% canny
+      sceneframe control ./output -p 100 --depth 25 --canny 25 --image-base 50
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -472,11 +479,14 @@ def control(
         click.echo("Error: --percentage must be between 0 and 100.", err=True)
         raise SystemExit(1)
 
-    if abs(depth + canny - 100) > 0.01:
-        click.echo(f"Error: --depth ({depth}) + --canny ({canny}) must equal 100.", err=True)
+    if abs(depth + canny + image_base - 100) > 0.01:
+        click.echo(
+            f"Error: --depth ({depth}) + --canny ({canny}) + --image-base ({image_base}) must equal 100.",
+            err=True,
+        )
         raise SystemExit(1)
 
-    from .depth import _get_candidates, generate_canny_maps, generate_depth_maps
+    from .depth import _get_candidates, generate_canny_maps, generate_depth_maps, generate_image_base
 
     import random
 
@@ -497,20 +507,31 @@ def control(
     else:
         pool = list(all_candidates)
 
-    # Step 2: split pool into depth and canny
+    # Step 2: split pool into depth, canny, and image_base
     depth_count = round(len(pool) * depth / 100.0)
+    canny_count = round(len(pool) * canny / 100.0)
     random.shuffle(pool)
     depth_candidates = sorted(pool[:depth_count])
-    canny_candidates = sorted(pool[depth_count:])
+    canny_candidates = sorted(pool[depth_count:depth_count + canny_count])
+    base_candidates = sorted(pool[depth_count + canny_count:])
+
+    parts = []
+    if depth_candidates:
+        parts.append(f"{len(depth_candidates)} depth")
+    if canny_candidates:
+        parts.append(f"{len(canny_candidates)} canny")
+    if base_candidates:
+        parts.append(f"{len(base_candidates)} image_base")
 
     click.echo(
-        f"Found {len(all_candidates)} _B images without _C → "
+        f"Found {len(all_candidates)} _B images → "
         f"selecting {len(pool)} ({percentage:.0f}%): "
-        f"{len(depth_candidates)} depth + {len(canny_candidates)} canny"
+        + " + ".join(parts)
     )
 
     depth_saved = 0
     canny_saved = 0
+    base_saved = 0
 
     if depth_candidates:
         depth_saved = generate_depth_maps(
@@ -527,7 +548,11 @@ def control(
             high_threshold=canny_high,
         )
 
-    click.echo(f"\nDone! Generated {depth_saved} depth + {canny_saved} canny = {depth_saved + canny_saved} control maps -> {directory}")
+    if base_candidates:
+        base_saved = generate_image_base(base_candidates)
+
+    total = depth_saved + canny_saved + base_saved
+    click.echo(f"\nDone! Generated {depth_saved} depth + {canny_saved} canny + {base_saved} image_base = {total} control images -> {directory}")
 
 
 # ---------------------------------------------------------------------------

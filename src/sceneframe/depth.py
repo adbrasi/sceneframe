@@ -27,11 +27,12 @@ MODEL_PRESETS = {
 
 
 def _get_candidates(input_dir: Path) -> list[Path]:
-    """Find _B images without existing _C control maps."""
+    """Find _B images without existing _C or _image_base control images."""
     b_files = sorted(input_dir.glob("*_B.jpg"))
     return [
         f for f in b_files
         if not (f.parent / f.name.replace("_B.jpg", "_C.jpg")).exists()
+        and not (f.parent / f.name.replace("_B.jpg", "_image_base.jpg")).exists()
     ]
 
 
@@ -45,6 +46,42 @@ def _select_subset(
         random.seed(seed)
     count = max(1, int(len(candidates) * percentage / 100.0))
     return sorted(random.sample(candidates, count))
+
+
+def generate_image_base(candidates: list[Path]) -> int:
+    """Copy _A images as _image_base.jpg for selected _B candidates.
+
+    For each _B.jpg in candidates, finds the corresponding _A.jpg
+    and copies it as NNNNNN_image_base.jpg.
+
+    Parameters
+    ----------
+    candidates : list[Path]
+        List of _B.jpg files whose corresponding _A should be copied.
+
+    Returns
+    -------
+    int
+        Number of image_base files created.
+    """
+    import shutil
+
+    if not candidates:
+        return 0
+
+    logger.info("Generating image_base for %d images", len(candidates))
+    saved = 0
+
+    for b_path in tqdm(candidates, desc="Image base"):
+        a_path = b_path.parent / b_path.name.replace("_B.jpg", "_A.jpg")
+        if not a_path.exists():
+            logger.warning("Missing _A for %s, skipping", b_path.name)
+            continue
+        dest = b_path.parent / b_path.name.replace("_B.jpg", "_image_base.jpg")
+        shutil.copy2(str(a_path), str(dest))
+        saved += 1
+
+    return saved
 
 
 def generate_canny_maps(
