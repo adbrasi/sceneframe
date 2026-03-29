@@ -1110,22 +1110,24 @@ def main() -> int:
     elapsed = time.monotonic() - progress.start_time
     total_mb = progress.bytes_downloaded / (1024 * 1024)
     avg_speed = total_mb / elapsed if elapsed > 0 else 0
+    actual_done = progress.files_done
     if STOP_EVENT.is_set():
         log(
             f"\nInterrupted after {format_duration(elapsed)}. "
-            f"Downloads: {total_success}/{total_expected_files} | "
-            f"{total_mb:.0f} MB | avg {avg_speed:.1f} MB/s",
+            f"Downloads: {actual_done}/{total_expected_files} | "
+            f"{total_mb:.0f} MB | avg {avg_speed:.1f} MB/s | "
+            f"failed: {progress.files_failed}",
             args.quiet,
         )
         os._exit(130)
     log(
         f"\nDone in {format_duration(elapsed)}! "
-        f"Downloads: {total_success}/{total_expected_files} | "
+        f"Downloads: {actual_done}/{total_expected_files} | "
         f"{total_mb:.0f} MB | avg {avg_speed:.1f} MB/s | "
         f"failed: {progress.files_failed}",
         args.quiet,
     )
-    return 0 if total_success > 0 else 1
+    return 0 if actual_done > 0 else 1
 
 
 if __name__ == "__main__":
