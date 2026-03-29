@@ -37,7 +37,7 @@ def _detect_scenes_transnet(video_path: Path) -> list[SceneBoundary]:
     if total_frames <= 0 or fps <= 0:
         return []
 
-    model = TransNetV2()
+    model = TransNetV2(device="auto")
     scenes = model.detect_scenes(str(video_path))
 
     if not scenes:
