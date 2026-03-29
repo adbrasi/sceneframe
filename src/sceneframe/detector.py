@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 _transnet_model = None
 _transnet_available: bool | None = None  # None = not checked yet
 _transnet_lock = threading.Lock()
+_inference_lock = threading.Lock()  # GPU inference is not thread-safe
 
 
 @dataclass
@@ -70,22 +72,69 @@ def _get_transnet_model():
             return None
 
 
+def _decode_frames_opencv(video_path: Path) -> tuple[np.ndarray, float, int]:
+    """Decode all frames from video using OpenCV, resized to 48x27 RGB.
+
+    Returns (frames_array, fps, total_frames).
+    frames_array shape: [N, 27, 48, 3] uint8 RGB.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # BGR -> RGB, resize to 48x27 (width x height)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            small = cv2.resize(rgb, (48, 27))
+            frames.append(small)
+
+        if not frames:
+            return np.empty((0, 27, 48, 3), dtype=np.uint8), fps, total
+
+        return np.array(frames, dtype=np.uint8), fps, len(frames)
+    finally:
+        cap.release()
+
+
 def _detect_scenes_transnet(video_path: Path, model) -> list[SceneBoundary]:
-    """Detect scenes using TransNetV2 on GPU. Fast (~500+ fps on RTX 5090)."""
-    fps, total_frames = _get_video_info(video_path)
-    if total_frames <= 0 or fps <= 0:
+    """Detect scenes using TransNetV2 on GPU with OpenCV decoding (no ffmpeg).
+
+    Decodes frames via OpenCV (thread-safe per video), then runs GPU inference
+    with a lock to prevent concurrent CUDA writes.
+    """
+    import torch
+
+    # Decode on CPU (thread-safe, each thread has its own VideoCapture)
+    frames, fps, total_frames = _decode_frames_opencv(video_path)
+    if len(frames) == 0 or fps <= 0:
         return []
 
-    scenes = model.detect_scenes(str(video_path))
+    # GPU inference needs a lock (CUDA not thread-safe for writes)
+    frames_tensor = torch.from_numpy(frames)
+    with _inference_lock:
+        frames_tensor = frames_tensor.to(model.device)
+        with torch.no_grad():
+            single_pred, _ = model.predict_frames(frames_tensor)
 
-    if not scenes:
+    # Convert predictions to scene boundaries
+    scenes_array = model.predictions_to_scenes(single_pred.cpu().numpy())
+
+    if len(scenes_array) == 0:
         return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
 
     boundaries = []
-    for scene in scenes:
+    for start, end in scenes_array:
         boundaries.append(SceneBoundary(
-            start_frame=scene["start_frame"],
-            end_frame=scene["end_frame"],
+            start_frame=int(start),
+            end_frame=int(end),
             fps=fps,
         ))
     return boundaries
