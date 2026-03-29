@@ -30,8 +30,8 @@ from urllib.parse import urlencode, urlparse
 import urllib3
 
 API_BASE = "https://api.rule34.xxx/index.php"
-DEFAULT_RULE34_API_KEY = os.environ.get("RULE34_API_KEY", "")
-DEFAULT_RULE34_USER_ID = os.environ.get("RULE34_USER_ID", "")
+DEFAULT_RULE34_API_KEY = os.environ.get("RULE34_API_KEY") or os.environ.get("DEFAULT_RULE34_API_KEY", "")
+DEFAULT_RULE34_USER_ID = os.environ.get("RULE34_USER_ID") or os.environ.get("DEFAULT_RULE34_USER_ID", "")
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".m4v"}
 # Connection pools with keep-alive for maximum throughput on high-bandwidth links.
 _API_POOL = urllib3.PoolManager(
