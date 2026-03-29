@@ -8,7 +8,6 @@ Both are saved as _C.jpg alongside the source _B.jpg.
 """
 
 import logging
-import random
 from pathlib import Path
 
 import cv2
@@ -34,18 +33,6 @@ def _get_candidates(input_dir: Path) -> list[Path]:
         if not (f.parent / f.name.replace("_B.jpg", "_C.jpg")).exists()
         and not (f.parent / f.name.replace("_B.jpg", "_image_base.jpg")).exists()
     ]
-
-
-def _select_subset(
-    candidates: list[Path], percentage: float, seed: int | None = None,
-) -> list[Path]:
-    """Select a random percentage-based subset of candidates."""
-    if percentage >= 100.0 or not candidates:
-        return candidates
-    if seed is not None:
-        random.seed(seed)
-    count = max(1, int(len(candidates) * percentage / 100.0))
-    return sorted(random.sample(candidates, count))
 
 
 def generate_image_base(candidates: list[Path], source: str = "A") -> int:

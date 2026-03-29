@@ -284,11 +284,15 @@ def _load_metadata(directory: Path) -> dict[str, dict]:
         return {}
 
     metadata = {}
-    for line in meta_path.read_text(encoding="utf-8").splitlines():
+    for line_num, line in enumerate(meta_path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
         if not line:
             continue
-        entry = json.loads(line)
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            logger.warning("Skipping truncated JSON at line %d in %s", line_num, meta_path)
+            continue
         metadata[entry["label"]] = entry
     return metadata
 
@@ -303,9 +307,14 @@ def retry_nsfw_pairs(
 ) -> set[str]:
     """Try alternative frames for pairs that failed NSFW filter.
 
-    For each failed pair, reads the metadata to find the source video,
-    extracts a frame ~1s forward/backward within scene bounds, re-classifies
-    it, and replaces the image if it now passes.
+    For each failed pair, classifies A and B individually to determine which
+    frame(s) triggered the filter, then reads the metadata to find the source
+    video, extracts a frame ~1s forward/backward within scene bounds for the
+    offending frame(s), re-classifies the pair, and replaces the image only
+    if it now passes.
+
+    Replacement frames are written to temporary paths (*_retry.jpg) and only
+    promoted to final paths if the pair passes re-classification.
 
     Returns the set of labels that STILL need to be removed (retry failed).
     """
@@ -339,15 +348,46 @@ def retry_nsfw_pairs(
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    classifier = pipeline(
+        "image-classification",
+        model="Falconsai/nsfw_image_detection",
+        device=device,
+        batch_size=batch_size,
+    )
+
+    # Step 1: Classify each A and B individually to find which ones triggered NSFW
+    flagged_suffixes: dict[str, set[str]] = {}  # label -> {"A"} or {"B"} or {"A", "B"}
+    for label in sorted(retryable):
+        flagged: set[str] = set()
+        for suffix in ("A", "B"):
+            path = directory / f"{label}_{suffix}.jpg"
+            if not path.exists():
+                continue
+            img = Image.open(path).convert("RGB")
+            results = classifier([img])
+            top = max(results[0], key=lambda x: x["score"])
+            is_nsfw = top["label"] == "nsfw" and top["score"] >= confidence
+            if keep_nsfw:
+                # In keep_nsfw mode, we want NSFW content — flag frames that are SFW
+                if not is_nsfw:
+                    flagged.add(suffix)
+            else:
+                # In remove_nsfw mode, flag frames that are NSFW
+                if is_nsfw:
+                    flagged.add(suffix)
+        if flagged:
+            flagged_suffixes[label] = flagged
+
     # Group by video to open each one only once
     by_video: dict[str, list[str]] = {}
-    for label in retryable:
+    for label in flagged_suffixes:
         video = metadata[label]["video"]
         by_video.setdefault(video, []).append(label)
 
-    # Extract alternative frames
+    # Step 2: Extract alternative frames only for flagged suffixes, write to temp paths
     JPEG_QUALITY = 95
-    replaced_labels: set[str] = set()  # labels where we replaced at least one frame
+    # Track which (label, suffix) pairs got a temp replacement
+    replaced: dict[str, set[str]] = {}  # label -> set of suffixes replaced
 
     for video_path_str, video_labels in by_video.items():
         video_path = Path(video_path_str)
@@ -366,8 +406,10 @@ def retry_nsfw_pairs(
                 fps = meta["fps"]
                 offset = max(1, round(fps))
 
-                # Try both frames (A and B)
                 for suffix, frame_key in [("A", "frame_a"), ("B", "frame_b")]:
+                    if suffix not in flagged_suffixes[label]:
+                        continue  # This frame was not flagged, skip
+
                     frame_info = meta[frame_key]
                     idx = frame_info["index"]
                     scene_start = frame_info["scene_start"]
@@ -384,37 +426,34 @@ def retry_nsfw_pairs(
                         if not ret:
                             continue
 
-                        # Save the alternative frame temporarily
-                        img_path = directory / f"{label}_{suffix}.jpg"
+                        # Save to temporary path (not overwriting original)
+                        temp_path = directory / f"{label}_{suffix}_retry.jpg"
                         cv2.imwrite(
-                            str(img_path), alt_frame,
+                            str(temp_path), alt_frame,
                             [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
                         )
-                        replaced_labels.add(label)
+                        replaced.setdefault(label, set()).add(suffix)
                         break  # got a replacement, stop trying directions
         finally:
             cap.release()
 
+    replaced_labels = set(replaced.keys())
     if not replaced_labels:
         logger.info("No alternative frames found — all retry pairs will be removed")
         return labels_to_retry
 
-    # Re-classify the replaced pairs
+    # Step 3: Re-classify pairs using temp files where available, originals otherwise
     logger.info("Re-classifying %d pairs with replacement frames...", len(replaced_labels))
 
-    classifier = pipeline(
-        "image-classification",
-        model="Falconsai/nsfw_image_detection",
-        device=device,
-        batch_size=batch_size,
-    )
-
-    # Collect images for reclassification
     all_labels: list[str] = []
     all_paths: list[Path] = []
     for label in sorted(replaced_labels):
         for suffix in ("A", "B"):
-            path = directory / f"{label}_{suffix}.jpg"
+            # Use temp file if this suffix was replaced, otherwise use original
+            if label in replaced and suffix in replaced[label]:
+                path = directory / f"{label}_{suffix}_retry.jpg"
+            else:
+                path = directory / f"{label}_{suffix}.jpg"
             if path.exists():
                 all_labels.append(label)
                 all_paths.append(path)
@@ -439,11 +478,30 @@ def retry_nsfw_pairs(
         # Want SFW: pairs that are now SFW pass
         now_pass = replaced_labels - nsfw_labels
 
-    still_fail = retryable - now_pass
-    logger.info("NSFW retry: %d saved, %d still removed", len(now_pass), len(still_fail))
+    # Step 4: For passing pairs, promote temp files to final; delete stale control images
+    for label in now_pass:
+        if label not in replaced:
+            continue
+        for suffix in replaced[label]:
+            temp_path = directory / f"{label}_{suffix}_retry.jpg"
+            final_path = directory / f"{label}_{suffix}.jpg"
+            if temp_path.exists():
+                temp_path.rename(final_path)
+        # Delete stale _C and _image_base since they correspond to old frames
+        for stale_suffix in ("_C.jpg", "_image_base.jpg"):
+            stale_path = directory / f"{label}{stale_suffix}"
+            stale_path.unlink(missing_ok=True)
 
-    # Restore original frames for pairs that still fail
-    # (they were overwritten with alternatives, but will be deleted anyway)
+    # Step 5: For pairs that still fail, delete temp files (originals are untouched)
+    still_fail = retryable - now_pass
+    for label in still_fail:
+        if label not in replaced:
+            continue
+        for suffix in replaced[label]:
+            temp_path = directory / f"{label}_{suffix}_retry.jpg"
+            temp_path.unlink(missing_ok=True)
+
+    logger.info("NSFW retry: %d saved, %d still removed", len(now_pass), len(still_fail))
 
     return still_fail | no_metadata
 

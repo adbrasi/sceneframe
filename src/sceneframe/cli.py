@@ -269,7 +269,31 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     pairs_info = f" (max {max_pairs}/video)" if max_pairs else ""
     click.echo(f"Found {len(videos)} video(s). Mode: {mode}. Workers: {max_workers}{pairs_info}")
 
-    counters = {"intra": 0, "inter-seq": 0, "inter-slide": 0, "main": 0}
+    # Scan for existing pair files to avoid label collision on re-runs
+    def _find_max_label(directory: Path) -> int:
+        """Find the highest existing label number from *_A.jpg files."""
+        max_label = 0
+        if directory.exists():
+            for f in directory.glob("*_A.jpg"):
+                m = re.match(r"^(\d+)_A\.jpg$", f.name)
+                if m:
+                    max_label = max(max_label, int(m.group(1)))
+        return max_label
+
+    if mode == "all":
+        counters = {
+            "intra": _find_max_label(output / "intra"),
+            "inter-seq": _find_max_label(output / "inter-seq"),
+            "inter-slide": _find_max_label(output / "inter-slide"),
+            "main": 0,
+        }
+    else:
+        counters = {
+            "intra": 0,
+            "inter-seq": 0,
+            "inter-slide": 0,
+            "main": _find_max_label(output),
+        }
     total_pairs = 0
     processed = 0
 
@@ -512,6 +536,9 @@ def control(
     # Step 2: split pool into depth, canny, and image_base
     depth_count = round(len(pool) * depth / 100.0)
     canny_count = round(len(pool) * canny / 100.0)
+    # Clamp to prevent overflow when independent rounds sum > pool size
+    canny_count = min(canny_count, len(pool) - depth_count)
+    # image_base gets the remainder (pool[depth_count + canny_count:])
     random.shuffle(pool)
     depth_candidates = sorted(pool[:depth_count])
     canny_candidates = sorted(pool[depth_count:depth_count + canny_count])
