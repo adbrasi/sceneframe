@@ -80,12 +80,18 @@ def _get_video_duration(video_path: Path) -> float:
         cap.release()
 
 
-def _find_videos(input_dir: Path, min_duration: float = 0.0) -> list[Path]:
+def _find_videos(input_dir: Path, min_duration: float = 0.0, recursive: bool = True) -> list[Path]:
     """Find all video files in a directory, optionally filtering by minimum duration."""
-    candidates = sorted(
-        f for f in input_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
-    )
+    if recursive:
+        candidates = sorted(
+            f for f in input_dir.rglob("*")
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+        )
+    else:
+        candidates = sorted(
+            f for f in input_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+        )
     if min_duration <= 0:
         return candidates
 
@@ -99,7 +105,7 @@ def _find_videos(input_dir: Path, min_duration: float = 0.0) -> list[Path]:
     return result
 
 
-def _resolve_videos(input_path: Path, min_duration: float) -> list[Path]:
+def _resolve_videos(input_path: Path, min_duration: float, recursive: bool = True) -> list[Path]:
     """Resolve input path to a list of video files."""
     if input_path.is_file() and input_path.suffix.lower() == ".txt":
         lines = input_path.read_text(encoding="utf-8").splitlines()
@@ -112,7 +118,7 @@ def _resolve_videos(input_path: Path, min_duration: float) -> list[Path]:
             if not folder.is_dir():
                 click.echo(f"Skipping (not a directory): {line} -> {folder}", err=True)
                 continue
-            videos.extend(_find_videos(folder, min_duration=min_duration))
+            videos.extend(_find_videos(folder, min_duration=min_duration, recursive=recursive))
         return videos
     elif input_path.is_file():
         dur = _get_video_duration(input_path)
@@ -121,7 +127,7 @@ def _resolve_videos(input_path: Path, min_duration: float) -> list[Path]:
             raise SystemExit(1)
         return [input_path]
     else:
-        return _find_videos(input_path, min_duration=min_duration)
+        return _find_videos(input_path, min_duration=min_duration, recursive=recursive)
 
 
 def _detect_scenes_for_video(video_path: Path) -> tuple[Path, list[SceneBoundary]]:
@@ -240,7 +246,13 @@ def cli():
     default=None,
     help="Parallel workers for scene detection. Defaults to CPU count - 2.",
 )
-def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None):
+@click.option(
+    "--recursive/--no-recursive",
+    default=True,
+    show_default=True,
+    help="Search for videos recursively in subdirectories.",
+)
+def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool):
     """Extract frame pairs from video scenes.
 
     INPUT_PATH can be a directory, a single video file, or a .txt file with
@@ -257,7 +269,7 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
 
-    videos = _resolve_videos(input_path, min_duration)
+    videos = _resolve_videos(input_path, min_duration, recursive=recursive)
     if not videos:
         click.echo("No video files found.", err=True)
         raise SystemExit(1)
