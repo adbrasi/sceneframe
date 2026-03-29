@@ -21,14 +21,10 @@ DEFAULT_WORKERS = {
     "transnetv2": 16,       # ffmpeg decode is I/O bound; more workers keep GPU fed
 }
 
-# How many concurrent GPU inferences to allow (pipeline: while one runs,
-# another thread can prepare/enqueue its work on the CUDA stream)
-GPU_CONCURRENCY = 4
-
 # Singleton TransNetV2 model — loaded once, reused across all videos
 _transnet_model = None
 _transnet_lock = threading.Lock()
-_inference_semaphore = threading.Semaphore(GPU_CONCURRENCY)
+_inference_lock = threading.Lock()
 
 
 @dataclass
@@ -91,6 +87,7 @@ def _get_transnet_model():
 
         from transnetv2_pytorch import TransNetV2
         _transnet_model = TransNetV2(device="auto")
+        _transnet_model.eval()
         device = getattr(_transnet_model, "device", "unknown")
         logger.info("TransNetV2 loaded on device: %s", device)
         return _transnet_model
@@ -178,9 +175,9 @@ def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
     import torch
     frames_tensor = torch.from_numpy(frames.copy()).to(model.device)
 
-    # GPU inference with semaphore (allows GPU_CONCURRENCY concurrent inferences
-    # so threads can pipeline: one runs on GPU while others prepare/enqueue)
-    with _inference_semaphore:
+    # GPU inference with lock (one at a time — avoids VRAM contention
+    # that slows down large videos when multiple inferences compete)
+    with _inference_lock:
         with torch.no_grad():
             single_pred, _ = model.predict_frames(frames_tensor)
 
