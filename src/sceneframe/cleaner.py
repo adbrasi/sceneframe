@@ -668,25 +668,29 @@ def retry_nsfw_pairs(
                     scene_start = frame_info["scene_start"]
                     scene_end = frame_info["scene_end"]
 
-                    # Try forward, then backward
-                    for direction in (offset, -offset):
-                        alt_idx = idx + direction
-                        if alt_idx < scene_start or alt_idx >= scene_end:
-                            continue
+                    # Try multiple offsets: 1s, 2s, 3s forward then backward
+                    found_replacement = False
+                    for attempt in range(1, 4):
+                        if found_replacement:
+                            break
+                        for direction in (offset * attempt, -offset * attempt):
+                            alt_idx = idx + direction
+                            if alt_idx < scene_start or alt_idx >= scene_end:
+                                continue
 
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
-                        ret, alt_frame = cap.read()
-                        if not ret:
-                            continue
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
+                            ret, alt_frame = cap.read()
+                            if not ret:
+                                continue
 
-                        # Save to temporary path (not overwriting original)
-                        temp_path = directory / f"{label}_{suffix}_retry.jpg"
-                        cv2.imwrite(
-                            str(temp_path), alt_frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
-                        )
-                        replaced.setdefault(label, set()).add(suffix)
-                        break  # got a replacement, stop trying directions
+                            temp_path = directory / f"{label}_{suffix}_retry.jpg"
+                            cv2.imwrite(
+                                str(temp_path), alt_frame,
+                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+                            )
+                            replaced.setdefault(label, set()).add(suffix)
+                            found_replacement = True
+                            break
         finally:
             cap.release()
 
@@ -1060,8 +1064,10 @@ def clean_directory(
             if label in pairs:
                 for path in pairs[label].values():
                     path.unlink(missing_ok=True)
+            # Also delete control files not matched by _PAIR_RE
+            (directory / f"{label}_image_base.jpg").unlink(missing_ok=True)
 
-    # Step 6: orphan cleanup
+    # Step 7: orphan cleanup
     orphans = find_orphan_labels(directory)
     if not dry_run and orphans:
         pairs = scan_pairs(directory)
