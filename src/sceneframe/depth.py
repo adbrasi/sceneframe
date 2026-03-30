@@ -19,6 +19,7 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 JPEG_QUALITY = 95
+DEPTH_SIZE = (518, 518)
 
 MODEL_PRESETS = {
     "small": "depth-anything/Depth-Anything-V2-Small-hf",
@@ -208,7 +209,6 @@ def generate_depth_maps(
 
         # Resize all images to uniform dimensions so batch can be stacked
         # (processor's do_resize keeps aspect ratio, causing size mismatch)
-        DEPTH_SIZE = (518, 518)
         images_resized = [img.resize(DEPTH_SIZE, Image.BILINEAR) for img in images]
 
         inputs = processor(images=images_resized, return_tensors="pt")

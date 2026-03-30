@@ -15,9 +15,6 @@ logger = logging.getLogger(__name__)
 # Pattern for pair files: NNNNNN_A.jpg, NNNNNN_B.jpg, NNNNNN_C.jpg
 _PAIR_RE = re.compile(r"^(\d+)_([ABC])\.jpg$", re.IGNORECASE)
 
-# Popcount lookup table for fast hamming distance computation
-_POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
-
 
 def scan_pairs(directory: Path) -> dict[str, dict[str, Path]]:
     """Scan directory for image pairs. Returns {label: {"A": path, "B": path, ...}}."""
@@ -528,7 +525,6 @@ def retry_nsfw_pairs(
         by_video.setdefault(video, []).append(label)
 
     # Step 2: Extract alternative frames only for flagged suffixes, write to temp paths
-    JPEG_QUALITY = 95
     # Track which (label, suffix) pairs got a temp replacement
     replaced: dict[str, set[str]] = {}  # label -> set of suffixes replaced
 
