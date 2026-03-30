@@ -474,6 +474,15 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
 @click.option("--nsfw-confidence", type=float, default=0.5, show_default=True, help="NSFW classification confidence threshold.")
 @click.option("--nsfw-batch-size", type=int, default=64, show_default=True, help="Batch size for NSFW inference.")
 @click.option("--nsfw-device", type=str, default=None, help="Device for NSFW model (cuda/cpu). Auto-detects if not set.")
+@click.option("--smart-filter", is_flag=True, default=False, help="[Experimental] NSFW→YOLO cascade filter. Replaces --nsfw and --character.")
+@click.option("--sf-nsfw-batch-size", type=int, default=64, show_default=True, help="Smart filter: NSFW batch size.")
+@click.option("--sf-nsfw-confidence", type=float, default=0.5, show_default=True, help="Smart filter: NSFW confidence.")
+@click.option("--sf-nsfw-retries", type=int, default=3, show_default=True, help="Smart filter: NSFW retry attempts.")
+@click.option("--sf-yolo-batch-size", type=int, default=32, show_default=True, help="Smart filter: YOLO batch size.")
+@click.option("--sf-yolo-confidence", type=float, default=0.5, show_default=True, help="Smart filter: YOLO confidence.")
+@click.option("--sf-yolo-retries", type=int, default=3, show_default=True, help="Smart filter: YOLO retry attempts.")
+@click.option("--sf-anime-model", type=str, default=None, help="Smart filter: override anime YOLO model.")
+@click.option("--sf-device", type=str, default=None, help="Smart filter: device for all models (cuda/cpu).")
 @click.option("--similarity", type=float, default=0.96, show_default=True, help="Min cosine similarity for duplicate detection (0-1). Higher = stricter.")
 @click.option("--solid-threshold", type=float, default=12.0, show_default=True, help="Max std-dev per channel to consider solid color.")
 @click.option("--workers", "-w", type=int, default=16, show_default=True, help="Parallel workers for image processing.")
@@ -497,6 +506,15 @@ def clean(
     nsfw_confidence: float,
     nsfw_batch_size: int,
     nsfw_device: str | None,
+    smart_filter: bool,
+    sf_nsfw_batch_size: int,
+    sf_nsfw_confidence: float,
+    sf_nsfw_retries: int,
+    sf_yolo_batch_size: int,
+    sf_yolo_confidence: float,
+    sf_yolo_retries: int,
+    sf_anime_model: str | None,
+    sf_device: str | None,
     similarity: float,
     solid_threshold: float,
     workers: int,
@@ -511,6 +529,10 @@ def clean(
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if smart_filter and (nsfw or character):
+        click.echo("Error: --smart-filter is mutually exclusive with --nsfw and --character.", err=True)
+        raise SystemExit(1)
 
     from .cleaner import clean_directory
 
@@ -538,6 +560,16 @@ def clean(
         nsfw_confidence=nsfw_confidence,
         nsfw_batch_size=nsfw_batch_size,
         nsfw_device=nsfw_device,
+        smart_filter=smart_filter,
+        smart_filter_nsfw_batch_size=sf_nsfw_batch_size,
+        smart_filter_nsfw_device=sf_device,
+        smart_filter_nsfw_confidence=sf_nsfw_confidence,
+        smart_filter_nsfw_retries=sf_nsfw_retries,
+        smart_filter_yolo_batch_size=sf_yolo_batch_size,
+        smart_filter_yolo_device=sf_device,
+        smart_filter_yolo_confidence=sf_yolo_confidence,
+        smart_filter_yolo_retries=sf_yolo_retries,
+        smart_filter_anime_model=sf_anime_model,
         similarity=similarity,
         solid_threshold=solid_threshold,
         workers=workers,
@@ -549,9 +581,15 @@ def clean(
     if blur:
         click.echo(f"  Blurry pairs removed:      {stats['blur_removed']}")
     click.echo(f"  Duplicate pairs removed:   {stats['duplicates_removed']}")
-    if character:
+    if smart_filter:
+        click.echo(f"  Smart filter deleted:       {stats['smart_filter_deleted']}")
+        click.echo(f"    NSFW approved (pass 1):   {stats['smart_filter_nsfw_approved']}")
+        click.echo(f"    NSFW approved (retry):    {stats['smart_filter_nsfw_retry_approved']}")
+        click.echo(f"    YOLO approved:            {stats['smart_filter_yolo_approved']}")
+        click.echo(f"    YOLO approved (retry):    {stats['smart_filter_yolo_retry_approved']}")
+    if character and not smart_filter:
         click.echo(f"  No-character pairs removed: {stats['character_removed']}")
-    if nsfw:
+    if nsfw and not smart_filter:
         click.echo(f"  NSFW filtered pairs:       {stats['nsfw_removed']}")
     click.echo(f"  Orphan pairs removed:      {stats['orphans_removed']}")
     click.echo(f"  Total removed:             {stats['total_removed']}")

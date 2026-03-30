@@ -903,6 +903,16 @@ def clean_directory(
     nsfw_confidence: float = 0.5,
     nsfw_batch_size: int = 32,
     nsfw_device: str | None = None,
+    smart_filter: bool = False,
+    smart_filter_nsfw_batch_size: int = 64,
+    smart_filter_nsfw_device: str | None = None,
+    smart_filter_nsfw_confidence: float = 0.5,
+    smart_filter_nsfw_retries: int = 3,
+    smart_filter_yolo_batch_size: int = 32,
+    smart_filter_yolo_device: str | None = None,
+    smart_filter_yolo_confidence: float = 0.5,
+    smart_filter_yolo_retries: int = 3,
+    smart_filter_anime_model: str | None = None,
     similarity: float = 0.96,
     solid_threshold: float = 12.0,
     workers: int = 8,
@@ -926,6 +936,11 @@ def clean_directory(
         "duplicates_removed": 0,
         "character_removed": 0,
         "nsfw_removed": 0,
+        "smart_filter_deleted": 0,
+        "smart_filter_nsfw_approved": 0,
+        "smart_filter_nsfw_retry_approved": 0,
+        "smart_filter_yolo_approved": 0,
+        "smart_filter_yolo_retry_approved": 0,
         "orphans_removed": 0,
         "total_removed": 0,
         "remaining": 0,
@@ -966,8 +981,31 @@ def clean_directory(
         all_to_remove.update(dups)
         logger.info("Duplicate pairs to remove: %d", len(new_dups))
 
-    # Step 4: character detection on _A (YOLO)
-    if character:
+    # Step 4: smart filter (NSFW → YOLO cascade, replaces --nsfw and --character)
+    if smart_filter:
+        from .smart_filter import smart_filter_directory
+        sf_result = smart_filter_directory(
+            directory,
+            nsfw_batch_size=smart_filter_nsfw_batch_size,
+            nsfw_device=smart_filter_nsfw_device,
+            nsfw_confidence=smart_filter_nsfw_confidence,
+            nsfw_max_retries=smart_filter_nsfw_retries,
+            yolo_batch_size=smart_filter_yolo_batch_size,
+            yolo_device=smart_filter_yolo_device,
+            yolo_confidence=smart_filter_yolo_confidence,
+            yolo_max_retries=smart_filter_yolo_retries,
+            yolo_anime_model=smart_filter_anime_model,
+            labels_to_skip=all_to_remove,
+            dry_run=dry_run,
+        )
+        stats["smart_filter_deleted"] = sf_result.total_deleted
+        stats["smart_filter_nsfw_approved"] = sf_result.nsfw_approved
+        stats["smart_filter_nsfw_retry_approved"] = sf_result.nsfw_retry_approved
+        stats["smart_filter_yolo_approved"] = sf_result.yolo_approved
+        stats["smart_filter_yolo_retry_approved"] = sf_result.yolo_retry_approved
+
+    # Step 5: character detection on _A (YOLO) — skipped if smart_filter active
+    if character and not smart_filter:
         import random
 
         pairs = scan_pairs(directory)
@@ -993,8 +1031,8 @@ def clean_directory(
         all_to_remove.update(no_char)
         logger.info("No-character pairs to remove: %d", len(no_char))
 
-    # Step 5: NSFW filter (with retry)
-    if nsfw:
+    # Step 6: NSFW filter (with retry) — skipped if smart_filter active
+    if nsfw and not smart_filter:
         nsfw_labels = find_nsfw_labels(
             directory, keep_nsfw, nsfw_batch_size, nsfw_device, nsfw_confidence
         )
@@ -1039,6 +1077,7 @@ def clean_directory(
         + stats["duplicates_removed"]
         + stats["character_removed"]
         + stats["nsfw_removed"]
+        + stats["smart_filter_deleted"]
         + stats["orphans_removed"]
     )
 
