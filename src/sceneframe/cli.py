@@ -136,11 +136,12 @@ def _detect_scenes_for_video(
     video_path: Path,
     engine: str = "pyscenedetect",
     redetect: bool = True,
+    threshold: float = 0.5,
 ) -> tuple[Path, list[SceneBoundary]]:
     """Detect and re-segment scenes for a single video. Runs in worker thread."""
     from .detector import detect_scenes, re_detect_long_scenes
 
-    scenes = detect_scenes(video_path, engine=engine, show_progress=False)
+    scenes = detect_scenes(video_path, engine=engine, show_progress=False, threshold=threshold)
     # TransNetV2 already detects dissolves/gradual transitions — re_detect is
     # redundant and expensive (reopens video + runs PySceneDetect CPU per scene).
     if scenes and redetect and engine != "transnetv2":
@@ -279,7 +280,14 @@ def cli():
     default=False,
     help="Re-segment long scenes (>20s) with AdaptiveDetector. Only applies to pyscenedetect.",
 )
-def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool, engine: str, redetect: bool):
+@click.option(
+    "--threshold", "-t",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="TransNetV2 confidence threshold (0-1). Higher = fewer scenes, lower = more scenes.",
+)
+def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_pairs: int | None, workers: int | None, recursive: bool, resume: bool, engine: str, redetect: bool, threshold: float):
     """Extract frame pairs from video scenes.
 
     INPUT_PATH can be a directory, a single video file, or a .txt file with
@@ -393,7 +401,7 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
 
     if len(videos) == 1:
         try:
-            video_path, scenes = _detect_scenes_for_video(videos[0], engine=engine, redetect=redetect)
+            video_path, scenes = _detect_scenes_for_video(videos[0], engine=engine, redetect=redetect, threshold=threshold)
             pending_results[video_path] = scenes
         except VideoDecodeError:
             _skip_video(videos[0])
@@ -402,7 +410,7 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
     else:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         futures = {
-            executor.submit(_detect_scenes_for_video, v, engine, redetect): v
+            executor.submit(_detect_scenes_for_video, v, engine, redetect, threshold): v
             for v in videos
         }
         pbar = tqdm(total=len(futures), desc="Processing")

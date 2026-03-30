@@ -148,7 +148,7 @@ def _decode_frames_ffmpeg(video_path: Path, w: int = 48, h: int = 27) -> np.ndar
     return np.frombuffer(raw, dtype=np.uint8).reshape(n_frames, h, w, 3)
 
 
-def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
+def _detect_transnetv2(video_path: Path, threshold: float = 0.5) -> list[SceneBoundary]:
     """Detect scenes using TransNetV2 on GPU with ffmpeg pipe decoding.
 
     Pipeline:
@@ -186,7 +186,7 @@ def _detect_transnetv2(video_path: Path) -> list[SceneBoundary]:
     if hasattr(single_pred, "cpu"):
         single_pred = single_pred.cpu().numpy()
 
-    scenes_array = model.predictions_to_scenes(single_pred)
+    scenes_array = model.predictions_to_scenes(single_pred, threshold=threshold)
 
     if len(scenes_array) == 0:
         return [SceneBoundary(start_frame=0, end_frame=total_frames, fps=fps)]
@@ -209,6 +209,7 @@ def detect_scenes(
     video_path: Path,
     engine: str = "pyscenedetect",
     show_progress: bool = True,
+    threshold: float = 0.5,
 ) -> list[SceneBoundary]:
     """Detect scene boundaries in a video.
 
@@ -216,6 +217,8 @@ def detect_scenes(
     ----------
     engine : str
         "pyscenedetect" (CPU, default) or "transnetv2" (GPU).
+    threshold : float
+        TransNetV2 confidence threshold (0-1). Higher = fewer scenes.
 
     Returns a list of SceneBoundary. Returns empty list on failure.
     """
@@ -226,7 +229,7 @@ def detect_scenes(
 
     try:
         if engine == "transnetv2":
-            return _detect_transnetv2(video_path)
+            return _detect_transnetv2(video_path, threshold=threshold)
         else:
             return _detect_pyscenedetect(video_path, show_progress)
     except VideoDecodeError:
