@@ -295,6 +295,45 @@ def _compute_feature_vector(image: np.ndarray) -> np.ndarray:
     return vec
 
 
+def find_similar_ab_labels(
+    directory: Path,
+    similarity: float = 0.93,
+    workers: int = 8,
+) -> set[str]:
+    """Find pairs where _A and _B are too similar (no meaningful scene change).
+
+    Compares _A vs _B within each pair using cosine similarity on
+    downscaled grayscale feature vectors.
+    """
+    pairs = scan_pairs(directory)
+    tasks: list[tuple[str, Path, Path]] = []
+    for label, files in sorted(pairs.items()):
+        if "A" in files and "B" in files:
+            tasks.append((label, files["A"], files["B"]))
+
+    if not tasks:
+        return set()
+
+    def _check(task: tuple[str, Path, Path]) -> tuple[str, float]:
+        label, path_a, path_b = task
+        img_a = cv2.imread(str(path_a))
+        img_b = cv2.imread(str(path_b))
+        if img_a is None or img_b is None:
+            return label, 0.0
+        vec_a = _compute_feature_vector(img_a)
+        vec_b = _compute_feature_vector(img_b)
+        sim = float(np.dot(vec_a, vec_b))
+        return label, sim
+
+    labels_to_remove: set[str] = set()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for label, sim in tqdm(pool.map(_check, tasks), total=len(tasks), desc="A↔B similarity"):
+            if sim >= similarity:
+                labels_to_remove.add(label)
+
+    return labels_to_remove
+
+
 def find_duplicate_labels(
     directory: Path,
     similarity: float = 0.93,
@@ -937,6 +976,7 @@ def clean_directory(
     stats = {
         "solid_removed": 0,
         "blur_removed": 0,
+        "similar_ab_removed": 0,
         "duplicates_removed": 0,
         "character_removed": 0,
         "nsfw_removed": 0,
@@ -977,7 +1017,15 @@ def clean_directory(
         all_to_remove.update(still_blurry)
         logger.info("Blurry pairs to remove: %d (after retry)", len(still_blurry))
 
-    # Step 3: duplicates
+    # Step 3: A↔B similarity (remove pairs where A and B are too similar)
+    if remove_dups:
+        similar_ab = find_similar_ab_labels(directory, similarity=similarity, workers=workers)
+        new_similar = similar_ab - all_to_remove
+        stats["similar_ab_removed"] = len(new_similar)
+        all_to_remove.update(similar_ab)
+        logger.info("Similar A↔B pairs to remove: %d", len(new_similar))
+
+    # Step 4: cross-pair duplicates
     if remove_dups:
         dups = find_duplicate_labels(directory, similarity=similarity, workers=workers)
         new_dups = dups - all_to_remove
@@ -1080,6 +1128,7 @@ def clean_directory(
     stats["total_removed"] = (
         stats["solid_removed"]
         + stats["blur_removed"]
+        + stats["similar_ab_removed"]
         + stats["duplicates_removed"]
         + stats["character_removed"]
         + stats["nsfw_removed"]

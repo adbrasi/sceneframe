@@ -591,6 +591,7 @@ def clean(
     click.echo(f"  Solid color pairs removed: {stats['solid_removed']}")
     if blur:
         click.echo(f"  Blurry pairs removed:      {stats['blur_removed']}")
+    click.echo(f"  Similar A↔B removed:       {stats['similar_ab_removed']}")
     click.echo(f"  Duplicate pairs removed:   {stats['duplicates_removed']}")
     if smart_filter:
         click.echo(f"  Smart filter deleted:       {stats['smart_filter_deleted']}")
