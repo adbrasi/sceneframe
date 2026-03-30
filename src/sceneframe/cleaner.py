@@ -1,7 +1,8 @@
-"""Image pair cleaning: solid color removal, deduplication, NSFW filtering."""
+"""Image pair cleaning: solid color, blur, duplicates, character, and NSFW filtering."""
 
 import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -76,6 +77,137 @@ def find_solid_color_labels(
                 labels_to_remove.add(result)
 
     return labels_to_remove
+
+
+# ---------------------------------------------------------------------------
+# Blur detection (Laplacian variance on _A images)
+# ---------------------------------------------------------------------------
+
+JPEG_QUALITY = 95
+
+
+def is_blurry(image: np.ndarray, threshold: float = 100.0) -> bool:
+    """Check if an image is blurry using Laplacian variance.
+
+    A sharp image has high variance (many diverse edges), a blurry one
+    has low variance (everything smoothed out).
+    """
+    if image is None:
+        return True
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return score < threshold
+
+
+def find_blur_labels(
+    directory: Path,
+    threshold: float = 100.0,
+    workers: int = 8,
+) -> set[str]:
+    """Find pair labels where _A image is blurry (motion blur, out of focus)."""
+    pairs = scan_pairs(directory)
+    tasks: list[tuple[str, Path]] = []
+    for label, files in pairs.items():
+        if "A" in files:
+            tasks.append((label, files["A"]))
+
+    if not tasks:
+        return set()
+
+    def _check(task: tuple[str, Path]) -> str | None:
+        label, path = task
+        img = cv2.imread(str(path))
+        return label if is_blurry(img, threshold) else None
+
+    labels_to_remove: set[str] = set()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for result in tqdm(pool.map(_check, tasks), total=len(tasks), desc="Blur check"):
+            if result is not None:
+                labels_to_remove.add(result)
+
+    return labels_to_remove
+
+
+def retry_blur_pairs(
+    directory: Path,
+    labels_to_retry: set[str],
+    threshold: float = 100.0,
+    max_retries: int = 3,
+    frame_advance: int = 12,
+) -> set[str]:
+    """Try alternative frames for pairs where _A is blurry.
+
+    Advances frame_advance frames forward per attempt (up to max_retries).
+    Overwrites _A directly if a non-blurry replacement is found.
+
+    Returns the set of labels that still need to be removed.
+    """
+    metadata = _load_metadata(directory)
+    if not metadata:
+        logger.warning("No pairs_metadata.jsonl found — cannot retry blurry pairs")
+        return labels_to_retry
+
+    retryable = {l for l in labels_to_retry if l in metadata}
+    no_metadata = labels_to_retry - retryable
+
+    if no_metadata:
+        logger.info("No metadata for %d blurry pairs — will be removed without retry", len(no_metadata))
+    if not retryable:
+        return labels_to_retry
+
+    logger.info("Retrying blur for %d pairs with alternative frames...", len(retryable))
+
+    # Group by video to open each one only once
+    by_video: dict[str, list[str]] = {}
+    for label in retryable:
+        video = metadata[label]["video"]
+        by_video.setdefault(video, []).append(label)
+
+    saved = 0
+    for video_path_str, video_labels in by_video.items():
+        video_path = Path(video_path_str)
+        if not video_path.exists():
+            continue
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            continue
+
+        try:
+            for label in video_labels:
+                meta = metadata[label]
+                frame_info = meta["frame_a"]
+                idx = frame_info["index"]
+                scene_start = frame_info["scene_start"]
+                scene_end = frame_info["scene_end"]
+
+                for attempt in range(1, max_retries + 1):
+                    alt_idx = idx + (frame_advance * attempt)
+                    if alt_idx >= scene_end:
+                        break
+
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
+                    ret, alt_frame = cap.read()
+                    if not ret:
+                        continue
+
+                    if not is_blurry(alt_frame, threshold):
+                        final_path = directory / f"{label}_A.jpg"
+                        cv2.imwrite(
+                            str(final_path), alt_frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+                        )
+                        retryable.discard(label)
+                        saved += 1
+                        # Delete stale control images
+                        for stale in ("_C.jpg", "_image_base.jpg"):
+                            (directory / f"{label}{stale}").unlink(missing_ok=True)
+                        break
+        finally:
+            cap.release()
+
+    logger.info("Blur retry: %d saved, %d still removed", saved, len(retryable))
+    return retryable | no_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +651,118 @@ def retry_nsfw_pairs(
 
 
 # ---------------------------------------------------------------------------
+# Character detection (YOLO: person + anime face)
+# ---------------------------------------------------------------------------
+
+YOLO_COCO_MODEL = "yolov8n.pt"
+YOLO_ANIME_MODEL = "https://huggingface.co/Anzhc/Anzhcs_YOLOs/resolve/main/Anzhc%20Face%20seg%20640%20v4%20y11n.pt"
+
+_yolo_models: tuple | None = None
+_yolo_load_lock = threading.Lock()
+_yolo_inference_lock = threading.Lock()
+
+
+def _get_yolo_models(device: str | None = None, anime_model_id: str | None = None):
+    """Load YOLO models (singleton, thread-safe). Returns (coco_model, anime_model)."""
+    global _yolo_models
+
+    if _yolo_models is not None:
+        return _yolo_models
+
+    with _yolo_load_lock:
+        if _yolo_models is not None:
+            return _yolo_models
+
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise RuntimeError(
+                "Character detection requires ultralytics. "
+                "Install with: pip install ultralytics"
+            )
+
+        anime_id = anime_model_id or YOLO_ANIME_MODEL
+
+        logger.info("Loading YOLO COCO model: %s", YOLO_COCO_MODEL)
+        coco_model = YOLO(YOLO_COCO_MODEL)
+        if device:
+            coco_model.to(device)
+
+        logger.info("Loading YOLO anime face model: %s", anime_id)
+        anime_model = YOLO(anime_id)
+        if device:
+            anime_model.to(device)
+
+        _yolo_models = (coco_model, anime_model)
+        return _yolo_models
+
+
+def find_no_character_labels(
+    directory: Path,
+    labels_to_check: set[str],
+    confidence: float = 0.5,
+    batch_size: int = 32,
+    device: str | None = None,
+    anime_model_id: str | None = None,
+) -> set[str]:
+    """Find labels where _A has no detectable character/person.
+
+    Uses two YOLO models simultaneously:
+    1. Standard COCO (detects "person", class 0)
+    2. Anime face model (detects anime/cartoon faces)
+
+    If EITHER model detects a character, the image passes.
+    Returns labels to REMOVE (no character found in _A).
+    """
+    if not labels_to_check:
+        return set()
+
+    coco_model, anime_model = _get_yolo_models(device, anime_model_id)
+
+    # Collect _A paths for labels to check
+    all_labels: list[str] = []
+    all_paths: list[str] = []
+    for label in sorted(labels_to_check):
+        path = directory / f"{label}_A.jpg"
+        if path.exists():
+            all_labels.append(label)
+            all_paths.append(str(path))
+
+    if not all_paths:
+        return set()
+
+    logger.info("Character detection on %d _A images...", len(all_paths))
+
+    # Track which labels have a character detected
+    has_character: set[str] = set()
+
+    for i in tqdm(range(0, len(all_paths), batch_size), desc="Character detection"):
+        batch_paths = all_paths[i : i + batch_size]
+        batch_labels = all_labels[i : i + batch_size]
+
+        with _yolo_inference_lock:
+            # COCO model: check for "person" (class 0)
+            coco_results = coco_model.predict(
+                batch_paths, conf=confidence, verbose=False, classes=[0],
+            )
+            # Anime face model: check for any detection
+            anime_results = anime_model.predict(
+                batch_paths, conf=confidence, verbose=False,
+            )
+
+        for label, coco_r, anime_r in zip(batch_labels, coco_results, anime_results):
+            coco_has = len(coco_r.boxes) > 0 if coco_r.boxes is not None else False
+            anime_has = len(anime_r.boxes) > 0 if anime_r.boxes is not None else False
+            if coco_has or anime_has:
+                has_character.add(label)
+
+    no_character = labels_to_check - has_character
+    logger.info("Character detection: %d have characters, %d do not",
+                len(has_character), len(no_character))
+    return no_character
+
+
+# ---------------------------------------------------------------------------
 # Orphan cleanup
 # ---------------------------------------------------------------------------
 
@@ -536,6 +780,16 @@ def clean_directory(
     directory: Path,
     remove_solid: bool = True,
     remove_dups: bool = True,
+    blur: bool = False,
+    blur_threshold: float = 100.0,
+    blur_max_retries: int = 3,
+    character: bool = False,
+    character_percentage: float = 100.0,
+    character_confidence: float = 0.5,
+    character_batch_size: int = 32,
+    character_device: str | None = None,
+    character_anime_model: str | None = None,
+    character_seed: int | None = None,
     nsfw: bool = False,
     keep_nsfw: bool = True,
     nsfw_confidence: float = 0.5,
@@ -550,15 +804,19 @@ def clean_directory(
 
     Steps (in order):
     1. Remove solid-color pairs
-    2. Remove duplicate pairs (cosine similarity)
-    3. NSFW filter (optional)
-    4. Remove orphaned pairs (missing A or B)
+    2. Remove blurry _A frames (with retry)
+    3. Remove duplicate pairs (cosine similarity)
+    4. Remove pairs without characters in _A (YOLO)
+    5. NSFW filter (optional)
+    6. Remove orphaned pairs (missing A or B)
 
     Returns dict with counts for each step.
     """
     stats = {
         "solid_removed": 0,
+        "blur_removed": 0,
         "duplicates_removed": 0,
+        "character_removed": 0,
         "nsfw_removed": 0,
         "orphans_removed": 0,
         "total_removed": 0,
@@ -574,7 +832,25 @@ def clean_directory(
         all_to_remove.update(solid)
         logger.info("Solid color pairs to remove: %d", len(solid))
 
-    # Step 2: duplicates
+    # Step 2: blur on _A (with retry)
+    if blur:
+        blur_labels = find_blur_labels(directory, blur_threshold, workers)
+        new_blur = blur_labels - all_to_remove
+
+        if new_blur:
+            still_blurry = retry_blur_pairs(
+                directory, new_blur,
+                threshold=blur_threshold,
+                max_retries=blur_max_retries,
+            )
+        else:
+            still_blurry = set()
+
+        stats["blur_removed"] = len(still_blurry)
+        all_to_remove.update(still_blurry)
+        logger.info("Blurry pairs to remove: %d (after retry)", len(still_blurry))
+
+    # Step 3: duplicates
     if remove_dups:
         dups = find_duplicate_labels(directory, similarity=similarity, workers=workers)
         new_dups = dups - all_to_remove
@@ -582,14 +858,40 @@ def clean_directory(
         all_to_remove.update(dups)
         logger.info("Duplicate pairs to remove: %d", len(new_dups))
 
-    # Step 3: NSFW filter (with retry)
+    # Step 4: character detection on _A (YOLO)
+    if character:
+        import random
+
+        pairs = scan_pairs(directory)
+        candidates = {l for l, f in pairs.items() if "A" in f} - all_to_remove
+
+        if character_seed is not None:
+            random.seed(character_seed)
+
+        if character_percentage < 100.0:
+            sample_size = max(1, int(len(candidates) * character_percentage / 100.0))
+            labels_to_check = set(random.sample(sorted(candidates), sample_size))
+        else:
+            labels_to_check = candidates
+
+        no_char = find_no_character_labels(
+            directory, labels_to_check,
+            confidence=character_confidence,
+            batch_size=character_batch_size,
+            device=character_device,
+            anime_model_id=character_anime_model,
+        )
+        stats["character_removed"] = len(no_char)
+        all_to_remove.update(no_char)
+        logger.info("No-character pairs to remove: %d", len(no_char))
+
+    # Step 5: NSFW filter (with retry)
     if nsfw:
         nsfw_labels = find_nsfw_labels(
             directory, keep_nsfw, nsfw_batch_size, nsfw_device, nsfw_confidence
         )
         new_nsfw = nsfw_labels - all_to_remove
 
-        # Retry: try alternative frames before giving up
         if new_nsfw:
             still_remove = retry_nsfw_pairs(
                 directory, new_nsfw,
@@ -613,7 +915,7 @@ def clean_directory(
                 for path in pairs[label].values():
                     path.unlink(missing_ok=True)
 
-    # Step 4: orphan cleanup
+    # Step 6: orphan cleanup
     orphans = find_orphan_labels(directory)
     if not dry_run and orphans:
         pairs = scan_pairs(directory)
@@ -625,7 +927,9 @@ def clean_directory(
 
     stats["total_removed"] = (
         stats["solid_removed"]
+        + stats["blur_removed"]
         + stats["duplicates_removed"]
+        + stats["character_removed"]
         + stats["nsfw_removed"]
         + stats["orphans_removed"]
     )

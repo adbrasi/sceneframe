@@ -449,6 +449,16 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option("--no-solid", is_flag=True, help="Skip solid-color removal.")
 @click.option("--no-duplicates", is_flag=True, help="Skip duplicate removal.")
+@click.option("--blur", is_flag=True, default=False, help="Remove blurry _A frames (Laplacian variance). Retries with nearby frames.")
+@click.option("--blur-threshold", type=float, default=100.0, show_default=True, help="Laplacian variance below this = blurry. Lower = stricter.")
+@click.option("--blur-max-retries", type=int, default=3, show_default=True, help="Max retry attempts for blurry frames (advance 12 frames each).")
+@click.option("--character", is_flag=True, default=False, help="Remove pairs without characters in _A (YOLO person + anime face).")
+@click.option("--character-percentage", type=float, default=100.0, show_default=True, help="% of pairs to check for characters (0-100).")
+@click.option("--character-confidence", type=float, default=0.5, show_default=True, help="YOLO detection confidence threshold.")
+@click.option("--character-batch-size", type=int, default=32, show_default=True, help="Batch size for YOLO inference.")
+@click.option("--character-device", type=str, default=None, help="Device for YOLO (cuda/cpu). Auto-detects if not set.")
+@click.option("--character-anime-model", type=str, default=None, help="Override anime face YOLO model (HuggingFace URL or local .pt).")
+@click.option("--character-seed", type=int, default=None, help="Random seed for character detection subset selection.")
 @click.option(
     "--nsfw/--no-nsfw",
     default=False,
@@ -472,6 +482,16 @@ def clean(
     directory: Path,
     no_solid: bool,
     no_duplicates: bool,
+    blur: bool,
+    blur_threshold: float,
+    blur_max_retries: int,
+    character: bool,
+    character_percentage: float,
+    character_confidence: float,
+    character_batch_size: int,
+    character_device: str | None,
+    character_anime_model: str | None,
+    character_seed: int | None,
     nsfw: bool,
     keep_nsfw: bool,
     nsfw_confidence: float,
@@ -482,7 +502,7 @@ def clean(
     workers: int,
     dry_run: bool,
 ):
-    """Clean image pairs: remove solid colors, duplicates, and optionally filter by NSFW.
+    """Clean image pairs: remove solid colors, blur, duplicates, no-character, and NSFW.
 
     DIRECTORY should contain image pairs named NNNNNN_A.jpg / NNNNNN_B.jpg.
     """
@@ -503,6 +523,16 @@ def clean(
         directory,
         remove_solid=not no_solid,
         remove_dups=not no_duplicates,
+        blur=blur,
+        blur_threshold=blur_threshold,
+        blur_max_retries=blur_max_retries,
+        character=character,
+        character_percentage=character_percentage,
+        character_confidence=character_confidence,
+        character_batch_size=character_batch_size,
+        character_device=character_device,
+        character_anime_model=character_anime_model,
+        character_seed=character_seed,
         nsfw=nsfw,
         keep_nsfw=keep_nsfw,
         nsfw_confidence=nsfw_confidence,
@@ -516,7 +546,11 @@ def clean(
 
     click.echo(f"\n--- Cleaning summary ---")
     click.echo(f"  Solid color pairs removed: {stats['solid_removed']}")
+    if blur:
+        click.echo(f"  Blurry pairs removed:      {stats['blur_removed']}")
     click.echo(f"  Duplicate pairs removed:   {stats['duplicates_removed']}")
+    if character:
+        click.echo(f"  No-character pairs removed: {stats['character_removed']}")
     if nsfw:
         click.echo(f"  NSFW filtered pairs:       {stats['nsfw_removed']}")
     click.echo(f"  Orphan pairs removed:      {stats['orphans_removed']}")
