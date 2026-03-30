@@ -27,8 +27,6 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-JPEG_QUALITY = 95
-
 
 @dataclass
 class SmartFilterResult:
@@ -49,21 +47,8 @@ def _cleanup_stale_temps(directory: Path):
 
 
 def _load_metadata(directory: Path) -> dict[str, dict]:
-    import json
-    meta_path = directory / "pairs_metadata.jsonl"
-    if not meta_path.exists():
-        return {}
-    metadata = {}
-    for line in meta_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        metadata[entry["label"]] = entry
-    return metadata
+    from .cleaner import _load_metadata as _cleaner_load_metadata
+    return _cleaner_load_metadata(directory)
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +161,7 @@ def _extract_retry_frames_for_images(
                         temp_path = directory / f"{label}_{suffix}_retry.jpg"
                         cv2.imwrite(
                             str(temp_path), frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+                            [cv2.IMWRITE_JPEG_QUALITY, 95],
                         )
                         replaced[(label, suffix)] = temp_path
                         found = True

@@ -474,7 +474,7 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
 @click.option("--nsfw-confidence", type=float, default=0.5, show_default=True, help="NSFW classification confidence threshold.")
 @click.option("--nsfw-batch-size", type=int, default=64, show_default=True, help="Batch size for NSFW inference.")
 @click.option("--nsfw-device", type=str, default=None, help="Device for NSFW model (cuda/cpu). Auto-detects if not set.")
-@click.option("--smart-filter", is_flag=True, default=False, help="[Experimental] NSFW→YOLO cascade filter. Replaces --nsfw and --character.")
+@click.option("--smart-filter", is_flag=True, default=False, help="[Experimental] Each image (_A and _B) must be NSFW or have a character (YOLO). Retries with nearby frames. Cannot be used with --nsfw or --character.")
 @click.option("--sf-nsfw-batch-size", type=int, default=64, show_default=True, help="Smart filter: NSFW batch size.")
 @click.option("--sf-nsfw-confidence", type=float, default=0.5, show_default=True, help="Smart filter: NSFW confidence.")
 @click.option("--sf-nsfw-retries", type=int, default=3, show_default=True, help="Smart filter: NSFW retry attempts.")
