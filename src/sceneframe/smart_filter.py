@@ -1,10 +1,17 @@
 """Smart filter: NSFW-first, YOLO-fallback cleaning pipeline.
 
-Checks BOTH _A and _B images. A pair is KEPT if:
-1. ANY image is classified as NSFW (pass 1 or retry), OR
-2. ANY YOLO model detects a character in ANY image (pass 1 or retry)
+Each image (_A and _B) must individually pass at least one check:
+- NSFW detected, OR
+- YOLO detects a person/character
 
-Otherwise the pair is DELETED.
+If EITHER image in a pair fails ALL checks (even after retries) → pair is DELETED.
+
+Pipeline per image:
+1. NSFW classification → pass if NSFW
+2. NSFW retry (advance frames) → pass if new frame is NSFW
+3. YOLO (person + anime face) → pass if character detected
+4. YOLO retry (advance frames) → pass if character detected
+5. Still nothing → image fails → pair deleted
 
 This replaces --nsfw and --character when --smart-filter is active.
 """
@@ -12,13 +19,15 @@ This replaces --nsfw and --character when --smart-filter is active.
 import gc
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+JPEG_QUALITY = 95
 
 
 @dataclass
@@ -28,27 +37,24 @@ class SmartFilterResult:
     yolo_approved: int = 0
     yolo_retry_approved: int = 0
     deleted: int = 0
-    no_metadata_deleted: int = 0
 
     @property
     def total_deleted(self) -> int:
-        return self.deleted + self.no_metadata_deleted
+        return self.deleted
 
 
 def _cleanup_stale_temps(directory: Path):
-    """Remove leftover _retry.jpg files from interrupted runs."""
     for stale in directory.glob("*_retry.jpg"):
         stale.unlink(missing_ok=True)
 
 
 def _load_metadata(directory: Path) -> dict[str, dict]:
-    """Load pairs_metadata.jsonl into a label-keyed dict."""
     import json
     meta_path = directory / "pairs_metadata.jsonl"
     if not meta_path.exists():
         return {}
     metadata = {}
-    for line_num, line in enumerate(meta_path.read_text(encoding="utf-8").splitlines(), 1):
+    for line in meta_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -61,30 +67,29 @@ def _load_metadata(directory: Path) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# NSFW classification helpers
+# NSFW helpers (per-image tracking)
 # ---------------------------------------------------------------------------
 
-def _nsfw_classify_batch(
-    all_paths: list[Path],
-    all_labels: list[str],
+def _nsfw_classify_images(
+    paths: list[Path],
     classifier,
     batch_size: int,
-) -> dict[str, bool]:
-    """Classify paths as NSFW. Returns {label: True if ANY image is NSFW}."""
+    confidence: float,
+) -> set[int]:
+    """Classify images. Returns set of indices that are NSFW."""
     from PIL import Image
 
-    nsfw_labels: set[str] = set()
+    nsfw_indices: set[int] = set()
 
-    def _load_batch(paths):
-        return [Image.open(p).convert("RGB") for p in paths]
+    def _load_batch(batch_paths):
+        return [Image.open(p).convert("RGB") for p in batch_paths]
 
     prefetch_pool = ThreadPoolExecutor(max_workers=8)
-    batches = list(range(0, len(all_paths), batch_size))
+    batches = list(range(0, len(paths), batch_size))
     next_future = None
 
     for bi, i in enumerate(tqdm(batches, desc="Smart filter: NSFW")):
-        batch_paths = all_paths[i : i + batch_size]
-        batch_labels = all_labels[i : i + batch_size]
+        batch_paths = paths[i : i + batch_size]
 
         if next_future is not None:
             images = next_future.result()
@@ -93,52 +98,45 @@ def _nsfw_classify_batch(
 
         if bi + 1 < len(batches):
             next_i = batches[bi + 1]
-            next_future = prefetch_pool.submit(_load_batch, all_paths[next_i : next_i + batch_size])
+            next_future = prefetch_pool.submit(_load_batch, paths[next_i : next_i + batch_size])
         else:
             next_future = None
 
         results = classifier(images)
-        for label, result in zip(batch_labels, results):
+        for j, result in enumerate(results):
             top = max(result, key=lambda x: x["score"])
-            if top["label"] == "nsfw" and top["score"] >= 0.5:
-                nsfw_labels.add(label)
+            if top["label"] == "nsfw" and top["score"] >= confidence:
+                nsfw_indices.add(i + j)
 
     prefetch_pool.shutdown(wait=False)
-    return nsfw_labels
+    return nsfw_indices
 
 
 # ---------------------------------------------------------------------------
-# Frame retry helpers
+# Frame retry
 # ---------------------------------------------------------------------------
 
-JPEG_QUALITY = 95
-
-
-def _extract_retry_frames(
+def _extract_retry_frames_for_images(
     directory: Path,
-    labels: set[str],
+    image_keys: list[tuple[str, str]],  # [(label, suffix), ...]
     metadata: dict[str, dict],
     max_retries: int,
-    suffixes: list[str] | None = None,
-) -> dict[str, dict[str, Path]]:
-    """Extract alternative frames for given labels, grouped by video.
+) -> dict[tuple[str, str], Path]:
+    """Extract alternative frames for specific (label, suffix) pairs.
 
-    Returns {label: {"A": temp_path, "B": temp_path}} for successfully extracted frames.
-    Only extracts for suffixes specified (default: both A and B).
+    Returns {(label, suffix): temp_path} for successfully extracted frames.
     """
-    if suffixes is None:
-        suffixes = ["A", "B"]
-
     suffix_to_key = {"A": "frame_a", "B": "frame_b"}
 
-    by_video: dict[str, list[str]] = {}
-    for label in labels:
+    # Group by video
+    by_video: dict[str, list[tuple[str, str]]] = {}
+    for label, suffix in image_keys:
         if label in metadata:
-            by_video.setdefault(metadata[label]["video"], []).append(label)
+            by_video.setdefault(metadata[label]["video"], []).append((label, suffix))
 
-    replaced: dict[str, dict[str, Path]] = {}
+    replaced: dict[tuple[str, str], Path] = {}
 
-    for video_path_str, video_labels in by_video.items():
+    for video_path_str, items in by_video.items():
         video_path = Path(video_path_str)
         if not video_path.exists():
             continue
@@ -148,159 +146,105 @@ def _extract_retry_frames(
             continue
 
         try:
-            for label in video_labels:
+            for label, suffix in items:
                 meta = metadata[label]
                 fps = meta["fps"]
                 offset_base = max(1, round(fps))
+                frame_key = suffix_to_key.get(suffix)
+                if not frame_key or frame_key not in meta:
+                    continue
 
-                for suffix in suffixes:
-                    frame_key = suffix_to_key.get(suffix)
-                    if not frame_key or frame_key not in meta:
-                        continue
+                frame_info = meta[frame_key]
+                idx = frame_info["index"]
+                scene_start = frame_info["scene_start"]
+                scene_end = frame_info["scene_end"]
 
-                    frame_info = meta[frame_key]
-                    idx = frame_info["index"]
-                    scene_start = frame_info["scene_start"]
-                    scene_end = frame_info["scene_end"]
+                for attempt in range(1, max_retries + 1):
+                    offset = offset_base * attempt
+                    found = False
 
-                    for attempt in range(1, max_retries + 1):
-                        offset = offset_base * attempt
-                        found = False
+                    for direction in (offset, -offset):
+                        alt_idx = idx + direction
+                        if alt_idx < scene_start or alt_idx >= scene_end:
+                            continue
 
-                        for direction in (offset, -offset):
-                            alt_idx = idx + direction
-                            if alt_idx < scene_start or alt_idx >= scene_end:
-                                continue
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
+                        ret, frame = cap.read()
+                        if not ret:
+                            continue
 
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, alt_idx)
-                            ret, frame = cap.read()
-                            if not ret:
-                                continue
+                        temp_path = directory / f"{label}_{suffix}_retry.jpg"
+                        cv2.imwrite(
+                            str(temp_path), frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+                        )
+                        replaced[(label, suffix)] = temp_path
+                        found = True
+                        break
 
-                            temp_path = directory / f"{label}_{suffix}_retry.jpg"
-                            cv2.imwrite(
-                                str(temp_path), frame,
-                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
-                            )
-                            replaced.setdefault(label, {})[suffix] = temp_path
-                            found = True
-                            break
-
-                        if found:
-                            break
+                    if found:
+                        break
         finally:
             cap.release()
 
     return replaced
 
 
-def _promote_temps(directory: Path, replaced: dict[str, dict[str, Path]], passing_labels: set[str]):
-    """Promote temp files for passing labels, delete temps for failing ones."""
-    for label, suffix_map in replaced.items():
-        if label in passing_labels:
-            for suffix, temp_path in suffix_map.items():
-                final_path = directory / f"{label}_{suffix}.jpg"
-                if temp_path.exists():
-                    temp_path.rename(final_path)
-            # Delete stale control images
-            for stale in ("_C.jpg", "_image_base.jpg"):
-                (directory / f"{label}{stale}").unlink(missing_ok=True)
+def _promote_image_temps(
+    directory: Path,
+    replaced: dict[tuple[str, str], Path],
+    passing_keys: set[tuple[str, str]],
+):
+    """Promote temp files for passing images, delete temps for failing ones."""
+    promoted_labels: set[str] = set()
+    for key, temp_path in replaced.items():
+        label, suffix = key
+        if key in passing_keys:
+            final_path = directory / f"{label}_{suffix}.jpg"
+            if temp_path.exists():
+                temp_path.rename(final_path)
+                promoted_labels.add(label)
         else:
-            for suffix, temp_path in suffix_map.items():
-                if temp_path.exists():
-                    temp_path.unlink(missing_ok=True)
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+    # Delete stale control images for promoted labels
+    for label in promoted_labels:
+        for stale in ("_C.jpg", "_image_base.jpg"):
+            (directory / f"{label}{stale}").unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# YOLO classification helpers
+# YOLO helpers (per-image tracking)
 # ---------------------------------------------------------------------------
 
-def _yolo_classify_labels(
-    directory: Path,
-    labels: set[str],
+def _yolo_classify_images(
+    paths: list[str],
     coco_model,
     anime_model,
     batch_size: int,
     confidence: float,
-) -> set[str]:
-    """Run YOLO on both _A and _B for given labels. Returns labels with character detected."""
-    all_labels: list[str] = []
-    all_paths: list[str] = []
+) -> set[int]:
+    """Run YOLO on images. Returns set of indices with character detected."""
+    has_character: set[int] = set()
 
-    for label in sorted(labels):
-        for suffix in ("A", "B"):
-            path = directory / f"{label}_{suffix}.jpg"
-            if path.exists():
-                all_labels.append(label)
-                all_paths.append(str(path))
-
-    if not all_paths:
-        return set()
-
-    has_character: set[str] = set()
-
-    for i in tqdm(range(0, len(all_paths), batch_size), desc="Smart filter: YOLO"):
-        batch_paths = all_paths[i : i + batch_size]
-        batch_labels = all_labels[i : i + batch_size]
+    for i in tqdm(range(0, len(paths), batch_size), desc="Smart filter: YOLO"):
+        batch_paths = paths[i : i + batch_size]
 
         coco_results = coco_model.predict(batch_paths, conf=confidence, verbose=False, classes=[0])
         anime_results = anime_model.predict(batch_paths, conf=confidence, verbose=False)
 
-        for label, coco_r, anime_r in zip(batch_labels, coco_results, anime_results):
+        for j, (coco_r, anime_r) in enumerate(zip(coco_results, anime_results)):
             coco_has = len(coco_r.boxes) > 0 if coco_r.boxes is not None else False
             anime_has = len(anime_r.boxes) > 0 if anime_r.boxes is not None else False
             if coco_has or anime_has:
-                has_character.add(label)
-
-    return has_character
-
-
-def _yolo_classify_temps(
-    directory: Path,
-    replaced: dict[str, dict[str, Path]],
-    labels: set[str],
-    coco_model,
-    anime_model,
-    batch_size: int,
-    confidence: float,
-) -> set[str]:
-    """Run YOLO on temp/original files for retry labels. Returns labels with character detected."""
-    all_labels: list[str] = []
-    all_paths: list[str] = []
-
-    for label in sorted(labels):
-        for suffix in ("A", "B"):
-            if label in replaced and suffix in replaced[label]:
-                path = replaced[label][suffix]
-            else:
-                path = directory / f"{label}_{suffix}.jpg"
-            if path.exists():
-                all_labels.append(label)
-                all_paths.append(str(path))
-
-    if not all_paths:
-        return set()
-
-    has_character: set[str] = set()
-
-    for i in range(0, len(all_paths), batch_size):
-        batch_paths = all_paths[i : i + batch_size]
-        batch_labels = all_labels[i : i + batch_size]
-
-        coco_results = coco_model.predict(batch_paths, conf=confidence, verbose=False, classes=[0])
-        anime_results = anime_model.predict(batch_paths, conf=confidence, verbose=False)
-
-        for label, coco_r, anime_r in zip(batch_labels, coco_results, anime_results):
-            coco_has = len(coco_r.boxes) > 0 if coco_r.boxes is not None else False
-            anime_has = len(anime_r.boxes) > 0 if anime_r.boxes is not None else False
-            if coco_has or anime_has:
-                has_character.add(label)
+                has_character.add(i + j)
 
     return has_character
 
 
 # ---------------------------------------------------------------------------
-# Main smart filter pipeline
+# Main pipeline
 # ---------------------------------------------------------------------------
 
 def smart_filter_directory(
@@ -317,15 +261,7 @@ def smart_filter_directory(
     labels_to_skip: set[str] | None = None,
     dry_run: bool = False,
 ) -> SmartFilterResult:
-    """Run the smart NSFW→YOLO filter pipeline.
-
-    Pipeline:
-    1. NSFW batch scan (both A and B) → approved pairs kept
-    2. NSFW retry for failures → more pairs saved
-    3. YOLO scan on remaining failures (both A and B, both models) → more kept
-    4. YOLO retry → last chance
-    5. Delete remaining failures
-    """
+    """Run the smart filter. Each image must pass NSFW or YOLO individually."""
     from .cleaner import scan_pairs
 
     _cleanup_stale_temps(directory)
@@ -339,6 +275,19 @@ def smart_filter_directory(
         return result
 
     metadata = _load_metadata(directory)
+
+    # Build image list: each image tracked individually
+    # image_keys[i] = (label, suffix), image_paths[i] = Path
+    image_keys: list[tuple[str, str]] = []
+    image_paths: list[Path] = []
+    for label in sorted(all_labels):
+        for suffix in ("A", "B"):
+            if suffix in pairs[label]:
+                image_keys.append((label, suffix))
+                image_paths.append(pairs[label][suffix])
+
+    # Track which images have passed (by index)
+    passed: set[int] = set()
 
     # -----------------------------------------------------------------------
     # Phase 1: NSFW batch
@@ -355,7 +304,8 @@ def smart_filter_directory(
     if nsfw_device is None:
         nsfw_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    logger.info("Smart filter phase 1: NSFW scan on %d pairs", len(all_labels))
+    logger.info("Smart filter phase 1: NSFW scan on %d images (%d pairs)",
+                len(image_paths), len(all_labels))
 
     classifier = hf_pipeline(
         "image-classification",
@@ -364,87 +314,58 @@ def smart_filter_directory(
         batch_size=nsfw_batch_size,
     )
 
-    # Collect all A+B paths
-    nsfw_scan_labels: list[str] = []
-    nsfw_scan_paths: list[Path] = []
-    for label in sorted(all_labels):
-        for suffix in ("A", "B"):
-            if suffix in pairs[label]:
-                nsfw_scan_labels.append(label)
-                nsfw_scan_paths.append(pairs[label][suffix])
-
-    nsfw_approved = _nsfw_classify_batch(
-        nsfw_scan_paths, nsfw_scan_labels, classifier, nsfw_batch_size,
-    )
-    result.nsfw_approved = len(nsfw_approved)
-    nsfw_failed = all_labels - nsfw_approved
-    logger.info("NSFW pass 1: %d approved, %d failed", result.nsfw_approved, len(nsfw_failed))
+    nsfw_passed = _nsfw_classify_images(image_paths, classifier, nsfw_batch_size, nsfw_confidence)
+    passed.update(nsfw_passed)
+    result.nsfw_approved = len(nsfw_passed)
+    logger.info("NSFW pass 1: %d/%d images passed", len(nsfw_passed), len(image_paths))
 
     # -----------------------------------------------------------------------
-    # Phase 2: NSFW retry
+    # Phase 2: NSFW retry for images that failed
     # -----------------------------------------------------------------------
-    if nsfw_failed and not dry_run:
-        retryable = {l for l in nsfw_failed if l in metadata}
-        no_meta = nsfw_failed - retryable
+    failed_indices = set(range(len(image_keys))) - passed
+    failed_image_keys = [(image_keys[i], i) for i in failed_indices]
+
+    if failed_image_keys and not dry_run and metadata:
+        # Only retry images with metadata
+        retryable = [(key, idx) for key, idx in failed_image_keys if key[0] in metadata]
 
         if retryable:
-            logger.info("Smart filter phase 2: NSFW retry for %d pairs", len(retryable))
+            logger.info("Smart filter phase 2: NSFW retry for %d images", len(retryable))
+            keys_to_retry = [key for key, _ in retryable]
+            idx_map = {key: idx for key, idx in retryable}
 
-            # Identify which individual images are NOT nsfw (need replacement)
-            from PIL import Image
-
-            flagged: dict[str, set[str]] = {}
-            step1_labels, step1_suffixes, step1_paths = [], [], []
-            for label in sorted(retryable):
-                for suffix in ("A", "B"):
-                    path = directory / f"{label}_{suffix}.jpg"
-                    if path.exists():
-                        step1_labels.append(label)
-                        step1_suffixes.append(suffix)
-                        step1_paths.append(path)
-
-            for i in range(0, len(step1_paths), nsfw_batch_size):
-                bp = step1_paths[i : i + nsfw_batch_size]
-                bl = step1_labels[i : i + nsfw_batch_size]
-                bs = step1_suffixes[i : i + nsfw_batch_size]
-                images = [Image.open(p).convert("RGB") for p in bp]
-                results = classifier(images)
-                for lbl, suf, res in zip(bl, bs, results):
-                    top = max(res, key=lambda x: x["score"])
-                    is_nsfw = top["label"] == "nsfw" and top["score"] >= nsfw_confidence
-                    if not is_nsfw:
-                        flagged.setdefault(lbl, set()).add(suf)
-
-            # Extract retry frames only for flagged suffixes
-            suffixes_per_label = {l: list(s) for l, s in flagged.items()}
-            replaced = _extract_retry_frames(
-                directory, set(flagged.keys()), metadata, nsfw_max_retries,
+            replaced = _extract_retry_frames_for_images(
+                directory, keys_to_retry, metadata, nsfw_max_retries,
             )
 
             if replaced:
-                # Re-classify replaced pairs
-                re_labels, re_paths = [], []
-                for label in sorted(replaced.keys()):
-                    for suffix in ("A", "B"):
-                        if label in replaced and suffix in replaced[label]:
-                            path = replaced[label][suffix]
-                        else:
-                            path = directory / f"{label}_{suffix}.jpg"
-                        if path.exists():
-                            re_labels.append(label)
-                            re_paths.append(path)
+                # Re-classify the temp files
+                retry_paths = [replaced[key] for key in replaced]
+                retry_keys_ordered = list(replaced.keys())
 
-                retry_nsfw = _nsfw_classify_batch(
-                    re_paths, re_labels, classifier, nsfw_batch_size,
-                )
-                _promote_temps(directory, replaced, retry_nsfw)
-                result.nsfw_retry_approved = len(retry_nsfw)
-                nsfw_failed = nsfw_failed - retry_nsfw
-                logger.info("NSFW retry: %d saved", result.nsfw_retry_approved)
+                from PIL import Image
+                retry_nsfw = set()
+                for i in range(0, len(retry_paths), nsfw_batch_size):
+                    bp = retry_paths[i : i + nsfw_batch_size]
+                    images = [Image.open(p).convert("RGB") for p in bp]
+                    results = classifier(images)
+                    for j, res in enumerate(results):
+                        top = max(res, key=lambda x: x["score"])
+                        if top["label"] == "nsfw" and top["score"] >= nsfw_confidence:
+                            retry_nsfw.add(i + j)
 
-        nsfw_failed = nsfw_failed  # includes no_meta labels
+                passing_keys: set[tuple[str, str]] = set()
+                for ri in retry_nsfw:
+                    key = retry_keys_ordered[ri]
+                    passing_keys.add(key)
+                    original_idx = idx_map[key]
+                    passed.add(original_idx)
 
-    # Unload NSFW model to free VRAM for YOLO
+                _promote_image_temps(directory, replaced, passing_keys)
+                result.nsfw_retry_approved = len(passing_keys)
+                logger.info("NSFW retry: %d images saved", len(passing_keys))
+
+    # Unload NSFW model
     del classifier
     gc.collect()
     try:
@@ -453,9 +374,11 @@ def smart_filter_directory(
         pass
 
     # -----------------------------------------------------------------------
-    # Phase 3: YOLO batch (only on NSFW failures)
+    # Phase 3: YOLO for still-failed images
     # -----------------------------------------------------------------------
-    if nsfw_failed:
+    still_failed_indices = set(range(len(image_keys))) - passed
+
+    if still_failed_indices:
         try:
             from ultralytics import YOLO
         except ImportError:
@@ -466,7 +389,7 @@ def smart_filter_directory(
 
         from .cleaner import YOLO_COCO_MODEL, YOLO_ANIME_MODEL
 
-        logger.info("Smart filter phase 3: YOLO scan on %d pairs", len(nsfw_failed))
+        logger.info("Smart filter phase 3: YOLO scan on %d images", len(still_failed_indices))
 
         anime_id = yolo_anime_model or YOLO_ANIME_MODEL
         coco_model = YOLO(YOLO_COCO_MODEL)
@@ -475,48 +398,79 @@ def smart_filter_directory(
             coco_model.to(yolo_device)
             anime_model.to(yolo_device)
 
-        yolo_approved = _yolo_classify_labels(
-            directory, nsfw_failed, coco_model, anime_model,
-            yolo_batch_size, yolo_confidence,
+        # Build paths for failed images only
+        yolo_indices = sorted(still_failed_indices)
+        yolo_paths = []
+        for idx in yolo_indices:
+            label, suffix = image_keys[idx]
+            # Use current file (may have been updated by NSFW retry)
+            path = directory / f"{label}_{suffix}.jpg"
+            yolo_paths.append(str(path))
+
+        yolo_passed_local = _yolo_classify_images(
+            yolo_paths, coco_model, anime_model, yolo_batch_size, yolo_confidence,
         )
-        result.yolo_approved = len(yolo_approved)
-        yolo_failed = nsfw_failed - yolo_approved
-        logger.info("YOLO pass 1: %d approved, %d failed", result.yolo_approved, len(yolo_failed))
+        # Map local indices back to global
+        for local_idx in yolo_passed_local:
+            passed.add(yolo_indices[local_idx])
+
+        result.yolo_approved = len(yolo_passed_local)
+        logger.info("YOLO pass 1: %d/%d images passed", len(yolo_passed_local), len(yolo_indices))
 
         # -------------------------------------------------------------------
         # Phase 4: YOLO retry
         # -------------------------------------------------------------------
-        if yolo_failed and not dry_run:
-            retryable_yolo = {l for l in yolo_failed if l in metadata}
-            if retryable_yolo:
-                logger.info("Smart filter phase 4: YOLO retry for %d pairs", len(retryable_yolo))
-                replaced_yolo = _extract_retry_frames(
-                    directory, retryable_yolo, metadata, yolo_max_retries,
-                )
-                if replaced_yolo:
-                    retry_yolo_approved = _yolo_classify_temps(
-                        directory, replaced_yolo, set(replaced_yolo.keys()),
-                        coco_model, anime_model, yolo_batch_size, yolo_confidence,
-                    )
-                    _promote_temps(directory, replaced_yolo, retry_yolo_approved)
-                    result.yolo_retry_approved = len(retry_yolo_approved)
-                    yolo_failed = yolo_failed - retry_yolo_approved
-                    logger.info("YOLO retry: %d saved", result.yolo_retry_approved)
+        still_failed_indices = set(range(len(image_keys))) - passed
+        yolo_failed_keys = [(image_keys[i], i) for i in still_failed_indices]
 
-        # Clean up YOLO models
+        if yolo_failed_keys and not dry_run and metadata:
+            retryable_yolo = [(key, idx) for key, idx in yolo_failed_keys if key[0] in metadata]
+
+            if retryable_yolo:
+                logger.info("Smart filter phase 4: YOLO retry for %d images", len(retryable_yolo))
+                keys_to_retry = [key for key, _ in retryable_yolo]
+                idx_map_yolo = {key: idx for key, idx in retryable_yolo}
+
+                replaced_yolo = _extract_retry_frames_for_images(
+                    directory, keys_to_retry, metadata, yolo_max_retries,
+                )
+
+                if replaced_yolo:
+                    retry_paths_y = [str(replaced_yolo[key]) for key in replaced_yolo]
+                    retry_keys_y = list(replaced_yolo.keys())
+
+                    yolo_retry_passed = _yolo_classify_images(
+                        retry_paths_y, coco_model, anime_model, yolo_batch_size, yolo_confidence,
+                    )
+
+                    passing_keys_y: set[tuple[str, str]] = set()
+                    for ri in yolo_retry_passed:
+                        key = retry_keys_y[ri]
+                        passing_keys_y.add(key)
+                        passed.add(idx_map_yolo[key])
+
+                    _promote_image_temps(directory, replaced_yolo, passing_keys_y)
+                    result.yolo_retry_approved = len(passing_keys_y)
+                    logger.info("YOLO retry: %d images saved", len(passing_keys_y))
+
         del coco_model, anime_model
         gc.collect()
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
-    else:
-        yolo_failed = set()
 
     # -----------------------------------------------------------------------
-    # Phase 5: Delete remaining failures
+    # Phase 5: Determine pairs to delete
     # -----------------------------------------------------------------------
-    to_delete = yolo_failed
+    # A pair is deleted if ANY of its images failed all checks
+    failed_images = set(range(len(image_keys))) - passed
+    labels_with_failed_image: set[str] = set()
+    for idx in failed_images:
+        label, suffix = image_keys[idx]
+        labels_with_failed_image.add(label)
+
+    to_delete = labels_with_failed_image
     result.deleted = len(to_delete)
 
     if not dry_run and to_delete:
@@ -525,15 +479,14 @@ def smart_filter_directory(
             if label in pairs:
                 for path in pairs[label].values():
                     path.unlink(missing_ok=True)
-            # Also delete control images
             for stale in ("_C.jpg", "_image_base.jpg"):
                 (directory / f"{label}{stale}").unlink(missing_ok=True)
 
-    total_kept = result.nsfw_approved + result.nsfw_retry_approved + result.yolo_approved + result.yolo_retry_approved
+    total_images = len(image_keys)
+    passed_count = len(passed)
     logger.info(
-        "Smart filter done: %d kept (%d nsfw + %d nsfw-retry + %d yolo + %d yolo-retry), %d deleted",
-        total_kept, result.nsfw_approved, result.nsfw_retry_approved,
-        result.yolo_approved, result.yolo_retry_approved, result.deleted,
+        "Smart filter done: %d/%d images passed, %d pairs deleted",
+        passed_count, total_images, result.deleted,
     )
 
     return result
