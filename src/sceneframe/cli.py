@@ -442,6 +442,9 @@ def extract(input_path: Path, output: Path, mode: str, min_duration: float, max_
             executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
             _flush_ready()
 
+    # Restore default signal handler so terminal returns to normal
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     skipped_msg = f" ({skipped_count} skipped → {skipped_dir})" if skipped_count else ""
     if cancelled:
         click.echo(f"\nCancelled. Saved {total_pairs} pairs from {processed} videos so far -> {output}{skipped_msg}")
