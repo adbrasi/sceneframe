@@ -202,14 +202,32 @@ def generate_depth_maps(
 
     saved = 0
 
-    for i in tqdm(range(0, len(candidates), batch_size), desc="Depth maps"):
-        batch_paths = candidates[i : i + batch_size]
-        images = [Image.open(p).convert("RGB") for p in batch_paths]
-        original_sizes = [img.size for img in images]  # (W, H)
+    # Prefetch: load+resize next batch while GPU runs current batch
+    def _load_batch(paths: list[Path]):
+        imgs = [Image.open(p).convert("RGB") for p in paths]
+        sizes = [img.size for img in imgs]
+        resized = [img.resize(DEPTH_SIZE, Image.BILINEAR) for img in imgs]
+        return resized, sizes
 
-        # Resize all images to uniform dimensions so batch can be stacked
-        # (processor's do_resize keeps aspect ratio, causing size mismatch)
-        images_resized = [img.resize(DEPTH_SIZE, Image.BILINEAR) for img in images]
+    prefetch_pool = ThreadPoolExecutor(max_workers=8)
+    batches = list(range(0, len(candidates), batch_size))
+    next_future = None
+
+    for bi, i in enumerate(tqdm(batches, desc="Depth maps")):
+        batch_paths = candidates[i : i + batch_size]
+
+        # Use prefetched images if available
+        if next_future is not None:
+            images_resized, original_sizes = next_future.result()
+        else:
+            images_resized, original_sizes = _load_batch(batch_paths)
+
+        # Prefetch next batch while GPU runs
+        if bi + 1 < len(batches):
+            next_i = batches[bi + 1]
+            next_future = prefetch_pool.submit(_load_batch, candidates[next_i : next_i + batch_size])
+        else:
+            next_future = None
 
         inputs = processor(images=images_resized, return_tensors="pt")
         inputs = {k: v.to(device, dtype=dtype) if v.is_floating_point() else v.to(device) for k, v in inputs.items()}
@@ -242,5 +260,7 @@ def generate_depth_maps(
             c_path = path.parent / path.name.replace("_B.jpg", "_C.jpg")
             cv2.imwrite(str(c_path), depth_norm, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             saved += 1
+
+    prefetch_pool.shutdown(wait=False)
 
     return saved

@@ -100,8 +100,13 @@ def find_blur_labels(
     directory: Path,
     threshold: float = 100.0,
     workers: int = 8,
+    batch_size: int = 128,
+    device: str | None = None,
 ) -> set[str]:
-    """Find pair labels where _A image is blurry (motion blur, out of focus)."""
+    """Find pair labels where _A image is blurry (motion blur, out of focus).
+
+    Uses GPU batched Laplacian when torch is available, falls back to CPU.
+    """
     pairs = scan_pairs(directory)
     tasks: list[tuple[str, Path]] = []
     for label, files in pairs.items():
@@ -111,16 +116,81 @@ def find_blur_labels(
     if not tasks:
         return set()
 
-    def _check(task: tuple[str, Path]) -> str | None:
-        label, path = task
-        img = cv2.imread(str(path))
-        return label if is_blurry(img, threshold) else None
+    # Try GPU path
+    try:
+        import torch
+        import torch.nn.functional as F
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        use_gpu = device != "cpu"
+    except ImportError:
+        use_gpu = False
 
-    labels_to_remove: set[str] = set()
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for result in tqdm(pool.map(_check, tasks), total=len(tasks), desc="Blur check"):
-            if result is not None:
-                labels_to_remove.add(result)
+    if not use_gpu:
+        # CPU fallback: ThreadPoolExecutor with per-image Laplacian
+        def _check(task: tuple[str, Path]) -> str | None:
+            label, path = task
+            img = cv2.imread(str(path))
+            return label if is_blurry(img, threshold) else None
+
+        labels_to_remove: set[str] = set()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for result in tqdm(pool.map(_check, tasks), total=len(tasks), desc="Blur check (CPU)"):
+                if result is not None:
+                    labels_to_remove.add(result)
+        return labels_to_remove
+
+    # GPU path: batch Laplacian via conv2d
+    logger.info("Blur detection on GPU (%s), %d images in batches of %d", device, len(tasks), batch_size)
+
+    # Laplacian 3x3 kernel
+    laplacian_kernel = torch.tensor(
+        [[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32,
+    ).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, 3, 3]
+
+    labels_to_remove = set()
+    all_labels = [t[0] for t in tasks]
+    all_paths = [t[1] for t in tasks]
+
+    def _load_gray(path: Path) -> np.ndarray | None:
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        return img
+
+    for i in tqdm(range(0, len(all_paths), batch_size), desc="Blur check (GPU)"):
+        batch_labels = all_labels[i : i + batch_size]
+        batch_paths = all_paths[i : i + batch_size]
+
+        # Load images in parallel (I/O)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            grays = list(pool.map(_load_gray, batch_paths))
+
+        # Build tensor batch — resize to uniform size for stacking
+        tensors = []
+        valid_indices = []
+        for idx, gray in enumerate(grays):
+            if gray is None:
+                labels_to_remove.add(batch_labels[idx])
+                continue
+            t = torch.from_numpy(gray.astype(np.float32)).unsqueeze(0)  # [1, H, W]
+            # Resize to uniform 512x512 for batching
+            t = F.interpolate(t.unsqueeze(0), size=(512, 512), mode="bilinear", align_corners=False).squeeze(0)
+            tensors.append(t)
+            valid_indices.append(idx)
+
+        if not tensors:
+            continue
+
+        batch_tensor = torch.stack(tensors).to(device)  # [B, 1, 512, 512]
+
+        with torch.no_grad():
+            laplacian = F.conv2d(batch_tensor, laplacian_kernel, padding=1)
+            # Variance per image: mean of squared values minus square of mean
+            variances = laplacian.pow(2).mean(dim=(1, 2, 3)) - laplacian.mean(dim=(1, 2, 3)).pow(2)
+
+        variances_cpu = variances.cpu().numpy()
+        for vi, var_val in zip(valid_indices, variances_cpu):
+            if var_val < threshold:
+                labels_to_remove.add(batch_labels[vi])
 
     return labels_to_remove
 
@@ -275,43 +345,65 @@ def find_duplicate_labels(
     features = np.vstack(vectors)  # (N, 4096) float32
     n = len(features)
 
-    # Greedy dedup via chunked cosine similarity (matrix multiplication)
+    # Try GPU path for similarity computation
+    try:
+        import torch
+        gpu_device = "cuda" if torch.cuda.is_available() else None
+    except ImportError:
+        gpu_device = None
+
     to_remove_idx: set[int] = set()
 
-    for start in tqdm(range(0, n, chunk_size), desc="Deduplicating"):
-        end = min(start + chunk_size, n)
-        chunk = features[start:end]  # (chunk, dim)
+    if gpu_device and n > 100:
+        # GPU path: tiled matrix multiply in FP16 for large datasets
+        logger.info("Deduplicating %d images on GPU (FP16 tiled)", n)
+        features_t = torch.from_numpy(features).to(gpu_device, dtype=torch.float16)
 
-        # Compare chunk against all images after it
-        # Only check forward to avoid double-counting
-        remaining = features[start + 1:]  # (N - start - 1, dim)
-        if remaining.shape[0] == 0:
-            break
+        for start in tqdm(range(0, n, chunk_size), desc="Deduplicating (GPU)"):
+            end = min(start + chunk_size, n)
+            chunk = features_t[start:end]  # (chunk, dim)
 
-        # Cosine similarity via dot product (vectors are pre-normalized)
-        sim_matrix = chunk @ remaining.T  # (chunk, N - start - 1)
+            # Compare chunk against all images after start
+            remaining = features_t[start + 1:]  # (N - start - 1, dim)
+            if remaining.shape[0] == 0:
+                break
 
-        for local_i in range(end - start):
-            global_i = start + local_i
-            if global_i in to_remove_idx:
-                continue
+            sim_matrix = (chunk @ remaining.T).cpu().float().numpy()
 
-            # Similarities for this image against all after it
-            # Offset: local_i maps to comparisons starting at (global_i + 1)
-            # In sim_matrix row local_i, column 0 = global_i+1, column 1 = global_i+2, etc.
-            # But we computed against features[start+1:], so column offset depends on local_i
-            col_offset = local_i  # first local_i columns are within-chunk (before global_i+1 relative to start+1)
-            # Actually: remaining starts at start+1. Image global_i compares against start+1..N-1.
-            # Column j in sim_matrix[local_i] corresponds to global index (start + 1 + j).
-            # We only want columns where global index > global_i, i.e. j > global_i - start - 1 = local_i - 1
-            # So we want columns from local_i onward.
-            row_sims = sim_matrix[local_i, local_i:]  # similarities against images after global_i
-            dup_cols = np.where(row_sims >= similarity)[0]
-            # Map back to global indices: global_i + 1 + dup_col
-            for dc in dup_cols:
-                dup_global = global_i + 1 + dc
-                if dup_global not in to_remove_idx:
-                    to_remove_idx.add(dup_global)
+            for local_i in range(end - start):
+                global_i = start + local_i
+                if global_i in to_remove_idx:
+                    continue
+                row_sims = sim_matrix[local_i, local_i:]
+                dup_cols = np.where(row_sims >= similarity)[0]
+                for dc in dup_cols:
+                    dup_global = global_i + 1 + dc
+                    if dup_global not in to_remove_idx:
+                        to_remove_idx.add(dup_global)
+
+        del features_t
+    else:
+        # CPU path: chunked cosine similarity via NumPy BLAS
+        for start in tqdm(range(0, n, chunk_size), desc="Deduplicating"):
+            end = min(start + chunk_size, n)
+            chunk = features[start:end]
+
+            remaining = features[start + 1:]
+            if remaining.shape[0] == 0:
+                break
+
+            sim_matrix = chunk @ remaining.T
+
+            for local_i in range(end - start):
+                global_i = start + local_i
+                if global_i in to_remove_idx:
+                    continue
+                row_sims = sim_matrix[local_i, local_i:]
+                dup_cols = np.where(row_sims >= similarity)[0]
+                for dc in dup_cols:
+                    dup_global = global_i + 1 + dc
+                    if dup_global not in to_remove_idx:
+                        to_remove_idx.add(dup_global)
 
     return {labels[i] for i in to_remove_idx}
 
@@ -378,10 +470,30 @@ def find_nsfw_labels(
     # Track which labels have at least one NSFW image
     nsfw_labels: set[str] = set()
 
-    for i in tqdm(range(0, len(all_paths), batch_size), desc="NSFW filter"):
+    # Prefetch: load next batch images while GPU processes current batch
+    def _load_batch(paths: list[Path]) -> list:
+        return [Image.open(p).convert("RGB") for p in paths]
+
+    prefetch_pool = ThreadPoolExecutor(max_workers=8)
+    batches = list(range(0, len(all_paths), batch_size))
+    next_future = None
+
+    for bi, i in enumerate(tqdm(batches, desc="NSFW filter")):
         batch_paths = all_paths[i : i + batch_size]
         batch_labels = all_labels[i : i + batch_size]
-        images = [Image.open(p).convert("RGB") for p in batch_paths]
+
+        # Use prefetched images if available, else load now
+        if next_future is not None:
+            images = next_future.result()
+        else:
+            images = _load_batch(batch_paths)
+
+        # Prefetch next batch while GPU runs
+        if bi + 1 < len(batches):
+            next_i = batches[bi + 1]
+            next_future = prefetch_pool.submit(_load_batch, all_paths[next_i : next_i + batch_size])
+        else:
+            next_future = None
 
         results = classifier(images)
 
@@ -389,6 +501,8 @@ def find_nsfw_labels(
             top = max(result, key=lambda x: x["score"])
             if top["label"] == "nsfw" and top["score"] >= confidence:
                 nsfw_labels.add(label)
+
+    prefetch_pool.shutdown(wait=False)
 
     # Decide which pairs to remove based on mode
     all_pair_labels = set(pairs.keys())
@@ -655,7 +769,6 @@ YOLO_ANIME_MODEL = "https://huggingface.co/Anzhc/Anzhcs_YOLOs/resolve/main/Anzhc
 
 _yolo_models: tuple | None = None
 _yolo_load_lock = threading.Lock()
-_yolo_inference_lock = threading.Lock()
 
 
 def _get_yolo_models(device: str | None = None, anime_model_id: str | None = None):
@@ -736,15 +849,14 @@ def find_no_character_labels(
         batch_paths = all_paths[i : i + batch_size]
         batch_labels = all_labels[i : i + batch_size]
 
-        with _yolo_inference_lock:
-            # COCO model: check for "person" (class 0)
-            coco_results = coco_model.predict(
-                batch_paths, conf=confidence, verbose=False, classes=[0],
-            )
-            # Anime face model: check for any detection
-            anime_results = anime_model.predict(
-                batch_paths, conf=confidence, verbose=False,
-            )
+        # COCO model: check for "person" (class 0)
+        coco_results = coco_model.predict(
+            batch_paths, conf=confidence, verbose=False, classes=[0],
+        )
+        # Anime face model: check for any detection
+        anime_results = anime_model.predict(
+            batch_paths, conf=confidence, verbose=False,
+        )
 
         for label, coco_r, anime_r in zip(batch_labels, coco_results, anime_results):
             coco_has = len(coco_r.boxes) > 0 if coco_r.boxes is not None else False
